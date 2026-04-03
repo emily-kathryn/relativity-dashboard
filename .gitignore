@@ -1,0 +1,5 @@
+build/
+out/
+*.swp
+*.DS_Store
+

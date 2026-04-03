@@ -1,52 +1,127 @@
-# Relativity Mission Dashboard
+# Relativity Mission Control
 
-An interactive tool for modeling time dilation in high-velocity space travel using special relativity.
+Relativity Mission Control is now a native C++ project for modeling one-way relativistic travel between two stationary points in flat spacetime. The project is built around a reusable simulation library, a command-line interface for repeatable calculations, and a native visualizer that focuses on the felt effect of time dilation rather than a dashboard of charts.
 
-## Features
-- Lorentz factor (gamma) calculation
-- Earth vs traveler time comparison
-- Mission presets for different destinations
-- Time difference graph showing relativistic effects
-- Real-time visualization with spaceship animation and signal propagation
-- Modular JavaScript architecture with ES modules
+This version is intentionally narrow and explicit:
 
-## Physics Formulas
+- It models special relativity, not cosmology.
+- It assumes Earth and the destination are stationary in the same inertial frame.
+- It models a symmetric outbound trip: accelerate for the first half, brake for the second half.
+- It computes Earth-frame time and traveler proper time directly from the relativistic worldline.
 
-The Lorentz factor γ is calculated as:
-γ = 1 / √(1 - v²/c²)
+That makes the physics transparent enough to extend later to round trips, Doppler effects, and eventually cosmological travel models.
 
-Where:
-- v is the velocity as a fraction of c (speed of light)
-- c is the speed of light
+## Why C++
 
-Time dilation:
-- Traveler time (proper time): t_traveler = distance / v
-- Earth time (dilated time): t_earth = t_traveler * γ
-- Time difference: Δt = t_earth - t_traveler
+The project now favors:
 
-Signal delay is the time for light to travel the distance: delay = distance (since c = 1 in these units)
+- a single compiled simulation core
+- deterministic numeric behavior
+- low-overhead real-time visualization
+- room to grow into richer rendering without changing languages again
 
-## How to Run Locally
+## Physics Model
 
-1. Ensure you have Python 3 installed
-2. Navigate to the project directory
-3. Run: `python3 -m http.server 8000`
-4. Open your browser to `http://localhost:8000`
+The current mission model uses units where:
 
-Alternatively, use any local server that serves static files (e.g., Node.js http-server, Apache, etc.)
+- distance is measured in light-years
+- time is measured in years
+- the speed of light is `c = 1 light-year / year`
 
-## Project Structure
+For a one-way mission with total Earth-frame distance `D` and midpoint peak speed `beta * c`:
 
-- `index.html`: Main HTML layout
-- `style.css`: Dark theme styling
-- `src/main.js`: Entry point and event connections
-- `src/ui.js`: UI updates and interactions
-- `src/physics.js`: Physics calculations
-- `src/charts.js`: Chart.js graph rendering
-- `src/visualization.js`: Canvas animation and visualization
+- Lorentz factor: `gamma = 1 / sqrt(1 - beta^2)`
+- Rapidity: `eta = atanh(beta)`
+- Proper acceleration for the symmetric half-trip:
+  `a = (gamma - 1) / (D / 2)`
+- During acceleration:
+  `x(tau) = (cosh(a tau) - 1) / a`
+  `t(tau) = sinh(a tau) / a`
+- Proper time still comes from the worldline, so the traveler ages less than the Earth frame across the same trip.
 
-## Future Improvements
-- Unit conversion (years ↔ days, light-years ↔ km)
-- Round-trip mission calculations
-- More realistic starfield generation
-- Audio effects for signal sending
+The visualizer now renders a single cinematic scene:
+
+- two synchronized clocks that visibly drift apart
+- a ship accelerating away from Earth and braking toward the destination
+- pulse rings and aging bars that show Earth time accumulating faster
+- direct playback controls and a mission-stage scrubber
+
+## Project Layout
+
+```text
+.
+├── CMakeLists.txt
+├── include/relativity/simulation.hpp
+├── src/lib/simulation.cpp
+├── src/cli/main.cpp
+├── src/visualizer/main.cpp
+└── tests/simulation_tests.cpp
+```
+
+## Build
+
+Configure and build everything:
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+If you only want the simulation library, CLI, and tests:
+
+```bash
+cmake -S . -B build -DRELATIVITY_BUILD_VISUALIZER=OFF
+cmake --build build
+```
+
+## Run
+
+CLI example:
+
+```bash
+./build/relativity_cli --distance 4.37 --beta 0.8
+```
+
+Export worldline samples as CSV:
+
+```bash
+./build/relativity_cli --distance 4.37 --beta 0.8 --samples 600 --csv mission.csv
+```
+
+Run tests:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Launch the visualizer:
+
+```bash
+./build/relativity_visualizer --distance 4.37 --beta 0.8
+```
+
+Visualizer controls:
+
+- click `Play` or press `Space` to start or pause travel
+- click `Reset` or press `Home` to return to departure
+- drag the slider to choose the mission stage directly
+- `Left` / `Right`: scrub backward or forward
+- mouse wheel: fine stage adjustments
+- `End`: jump to arrival
+
+## Next Physics Steps
+
+- round-trip missions and the twin paradox
+- Doppler shift and delayed observations
+- apparent versus measured effects
+- cosmology mode for intergalactic distances
+
+## Research Reading
+
+Useful starting points for understanding what the code is modeling:
+
+- Einstein (1905), *On the Electrodynamics of Moving Bodies*
+- Savage et al., *Real Time Relativity*
+- Weiskopf et al., *A Tutorial on Relativistic Visualization*
+- McGrath et al., *Visualizing relativity: The OpenRelativity project*
+- Davis and Lineweaver, *Expanding Confusion* for why distant galaxies need cosmology, not just special relativity
