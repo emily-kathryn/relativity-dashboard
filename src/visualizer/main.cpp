@@ -138,6 +138,14 @@ Vector2 LerpPoint(Vector2 start, Vector2 end, float amount) {
   };
 }
 
+Vector3 LerpPoint(Vector3 start, Vector3 end, float amount) {
+  return {
+      start.x + ((end.x - start.x) * amount),
+      start.y + ((end.y - start.y) * amount),
+      start.z + ((end.z - start.z) * amount),
+  };
+}
+
 Vector2 Normalize(Vector2 value) {
   const float length = std::sqrt((value.x * value.x) + (value.y * value.y));
   if (length <= 0.0001F) {
@@ -146,28 +154,37 @@ Vector2 Normalize(Vector2 value) {
   return {value.x / length, value.y / length};
 }
 
-Vector2 Rotate(Vector2 value, float angle) {
-  return {
-      (value.x * std::cos(angle)) - (value.y * std::sin(angle)),
-      (value.x * std::sin(angle)) + (value.y * std::cos(angle)),
-  };
+Vector3 Normalize(Vector3 value) {
+  const float length = std::sqrt((value.x * value.x) + (value.y * value.y) + (value.z * value.z));
+  if (length <= 0.0001F) {
+    return {0.0F, 0.0F, 0.0F};
+  }
+  return {value.x / length, value.y / length, value.z / length};
 }
 
-void DrawPerspectiveGrid(const Rectangle& bounds, Vector2 vanishing_point, Color color) {
-  for (int index = 0; index <= 14; ++index) {
-    const float x = bounds.x + ((bounds.width / 14.0F) * static_cast<float>(index));
-    DrawLineEx({x, bounds.y + bounds.height}, vanishing_point, 1.0F, color);
-  }
+Vector3 Add(Vector3 left, Vector3 right) {
+  return {left.x + right.x, left.y + right.y, left.z + right.z};
+}
 
-  const Vector2 bottom_left {bounds.x, bounds.y + bounds.height};
-  const Vector2 bottom_right {bounds.x + bounds.width, bounds.y + bounds.height};
-  for (int index = 1; index <= 10; ++index) {
-    const float amount = static_cast<float>(index) / 11.0F;
-    const float curved = amount * amount;
-    const Vector2 left = LerpPoint(bottom_left, vanishing_point, curved);
-    const Vector2 right = LerpPoint(bottom_right, vanishing_point, curved);
-    DrawLineEx(left, right, 1.0F, color);
-  }
+Vector3 Subtract(Vector3 left, Vector3 right) {
+  return {left.x - right.x, left.y - right.y, left.z - right.z};
+}
+
+Vector3 Scale(Vector3 value, float scale) {
+  return {value.x * scale, value.y * scale, value.z * scale};
+}
+
+Vector3 QuadraticBezierPoint(Vector3 start, Vector3 control, Vector3 end, float amount) {
+  const Vector3 a = LerpPoint(start, control, amount);
+  const Vector3 b = LerpPoint(control, end, amount);
+  return LerpPoint(a, b, amount);
+}
+
+float TubeRadius(double gamma, double maximum_gamma) {
+  const double gamma_span = std::max(0.0001, maximum_gamma - 1.0);
+  const float gamma_fraction = Clamp01(static_cast<float>((gamma - 1.0) / gamma_span));
+  const float widening = std::pow(1.0F - gamma_fraction, 2.35F);
+  return 0.16F + (1.28F * widening);
 }
 
 void DrawArrow(Vector2 start, Vector2 end, Color color, float thickness) {
@@ -187,21 +204,13 @@ void DrawArrow(Vector2 start, Vector2 end, Color color, float thickness) {
   DrawTriangle(end, wing_a, wing_b, color);
 }
 
-Vector2 EllipsePoint(Vector2 center, float rx, float ry, float rotation, float theta) {
-  const Vector2 local {rx * std::cos(theta), ry * std::sin(theta)};
-  const Vector2 rotated = Rotate(local, rotation);
-  return {center.x + rotated.x, center.y + rotated.y};
+void DrawPanel(const Rectangle& bounds, Color fill, Color outline) {
+  DrawRectangleRounded(bounds, 0.12F, 10, fill);
+  DrawRectangleRoundedLinesEx(bounds, 0.12F, 10, 1.0F, outline);
 }
 
-void DrawRotatedEllipseLines(Vector2 center, float rx, float ry, float rotation, int segments, float thickness,
-                             Color color) {
-  Vector2 previous = EllipsePoint(center, rx, ry, rotation, 0.0F);
-  for (int index = 1; index <= segments; ++index) {
-    const float theta = (static_cast<float>(index) / static_cast<float>(segments)) * 2.0F * PI;
-    const Vector2 current = EllipsePoint(center, rx, ry, rotation, theta);
-    DrawLineEx(previous, current, thickness, color);
-    previous = current;
-  }
+const char* DynamicsLabel(double signed_proper_acceleration) {
+  return signed_proper_acceleration < 0.0 ? "proper deceleration" : "proper acceleration";
 }
 
 const char* PhaseLabel(double progress) {
@@ -249,6 +258,8 @@ int main(int argc, char** argv) {
   const Rectangle play_button {60.0F, 736.0F, 92.0F, 32.0F};
   const Rectangle reset_button {164.0F, 736.0F, 92.0F, 32.0F};
   const Rectangle slider_track {304.0F, 751.0F, 700.0F, 8.0F};
+  const Rectangle state_panel {74.0F, 126.0F, 252.0F, 170.0F};
+  const Rectangle time_panel {1032.0F, 126.0F, 150.0F, 310.0F};
 
   const Color app_background {10, 12, 16, 255};
   const Color viewport_background {15, 17, 22, 255};
@@ -262,6 +273,20 @@ int main(int argc, char** argv) {
 
   bool custom_font_loaded = false;
   const Font ui_font = LoadUiFont(custom_font_loaded);
+  RenderTexture2D scene_target = LoadRenderTexture(static_cast<int>(viewport.width), static_cast<int>(viewport.height));
+  SetTextureFilter(scene_target.texture, TEXTURE_FILTER_BILINEAR);
+
+  Camera3D camera {};
+  camera.position = {0.0F, 6.6F, 18.0F};
+  camera.target = {0.0F, 0.8F, 0.0F};
+  camera.up = {0.0F, 1.0F, 0.0F};
+  camera.fovy = 30.0F;
+  camera.projection = CAMERA_PERSPECTIVE;
+
+  const Vector3 earth_world {-10.5F, 2.2F, -4.8F};
+  const Vector3 turnaround_world {0.0F, 0.6F, 0.0F};
+  const Vector3 destination_world {10.5F, -1.9F, 4.8F};
+  const Vector3 world_up {0.0F, 1.0F, 0.0F};
 
   bool playing = false;
   bool dragging_slider = false;
@@ -327,131 +352,112 @@ int main(int argc, char** argv) {
         static_cast<std::size_t>(std::round(stage * static_cast<float>(mission.samples.size() - 1))));
     const auto& current = mission.samples[current_index];
 
-    const Vector2 earth {viewport.x + 190.0F, viewport.y + 170.0F};
-    const Vector2 destination {viewport.x + viewport.width - 220.0F, viewport.y + viewport.height - 170.0F};
-    const Vector2 axis = Normalize({destination.x - earth.x, destination.y - earth.y});
-    const Vector2 normal {-axis.y, axis.x};
-    const float axis_angle = std::atan2(axis.y, axis.x);
-
     const float travel_fraction = static_cast<float>(current.position_ly / mission.profile.distance_ly);
-    const Vector2 ship = LerpPoint(earth, destination, travel_fraction);
-    const bool braking = current.signed_proper_acceleration_ly_per_year2 < 0.0;
+    const bool decelerating_phase = current.signed_proper_acceleration_ly_per_year2 < 0.0;
+    const Vector3 ship_world = QuadraticBezierPoint(earth_world, turnaround_world, destination_world, travel_fraction);
+    const float probe_offset_fraction = 0.003F;
+    const float previous_fraction = std::max(0.0F, travel_fraction - probe_offset_fraction);
+    const float next_fraction = std::min(1.0F, travel_fraction + probe_offset_fraction);
+    const Vector3 probe_previous = QuadraticBezierPoint(earth_world, turnaround_world, destination_world, previous_fraction);
+    const Vector3 probe_next = QuadraticBezierPoint(earth_world, turnaround_world, destination_world, next_fraction);
+    const Vector3 tube_direction = Normalize(Subtract(probe_next, probe_previous));
+    const Vector3 acceleration_offset_start = Add(ship_world, {0.0F, 0.8F, 0.0F});
+    const float acceleration_vector_length = 0.9F + (1.6F * static_cast<float>(current.beta));
+    const float acceleration_direction_sign = decelerating_phase ? -1.0F : 1.0F;
+    const Vector3 acceleration_vector_end =
+        Add(acceleration_offset_start, Scale(tube_direction, acceleration_vector_length * acceleration_direction_sign));
+    const Vector2 earth_label = GetWorldToScreenEx(earth_world, camera, static_cast<int>(viewport.width),
+                                                   static_cast<int>(viewport.height));
+    const Vector2 destination_label = GetWorldToScreenEx(destination_world, camera, static_cast<int>(viewport.width),
+                                                         static_cast<int>(viewport.height));
+    const Vector2 turnaround_label = GetWorldToScreenEx(turnaround_world, camera, static_cast<int>(viewport.width),
+                                                        static_cast<int>(viewport.height));
 
     BeginDrawing();
     ClearBackground(app_background);
 
     DrawUiText(ui_font, "Relativistic Proper-Time Simulation", 40.0F, 28.0F, 28.0F, text);
-    DrawUiText(ui_font,
-               "Narrower tube sections correspond to higher Lorentz factor and reduced proper-time accumulation.",
-               42.0F, 60.0F, 18.0F, muted);
+    DrawUiText(ui_font, "A true 3D world-tube: radius contracts as Lorentz factor increases.", 42.0F, 60.0F, 18.0F,
+               muted);
 
-    DrawRectangleRounded(viewport, 0.015F, 10, viewport_background);
+    BeginTextureMode(scene_target);
+    ClearBackground(viewport_background);
+    BeginMode3D(camera);
+
+    DrawGrid(24, 1.5F);
+    DrawLine3D(earth_world, destination_world, Fade(structure, 0.25F));
+    DrawSphereEx(earth_world, 0.42F, 18, 18, Fade(structure, 0.95F));
+    DrawSphereEx(destination_world, 0.34F, 16, 16, Fade(structure, 0.85F));
+
+    const std::size_t stride = std::max<std::size_t>(1, mission.samples.size() / 180);
+    bool midpoint_world_set = false;
+    Vector3 midpoint_world = turnaround_world;
+    float midpoint_radius = TubeRadius(mission.summary.gamma, mission.summary.gamma);
+
+    for (std::size_t index = 0; index < current_index; index += stride) {
+      const auto& start_sample = mission.samples[index];
+      const auto& end_sample = mission.samples[std::min(index + stride, current_index)];
+      const float start_fraction = static_cast<float>(start_sample.position_ly / mission.profile.distance_ly);
+      const float end_fraction = static_cast<float>(end_sample.position_ly / mission.profile.distance_ly);
+      const Vector3 start_point = QuadraticBezierPoint(earth_world, turnaround_world, destination_world, start_fraction);
+      const Vector3 end_point = QuadraticBezierPoint(earth_world, turnaround_world, destination_world, end_fraction);
+
+      const float start_radius = TubeRadius(start_sample.gamma, mission.summary.gamma);
+      const float end_radius = TubeRadius(end_sample.gamma, mission.summary.gamma);
+      const float completion = current_index > 0 ? static_cast<float>(index) / static_cast<float>(current_index) : 1.0F;
+      const Color fill_color = Fade(accent, 0.10F + (0.12F * completion));
+      const Color wire_color = Fade(accent, 0.25F + (0.30F * completion));
+
+      DrawCylinderEx(start_point, end_point, start_radius, end_radius, 18, fill_color);
+      DrawCylinderWiresEx(start_point, end_point, start_radius, end_radius, 18, wire_color);
+
+      if (!midpoint_world_set && end_fraction >= 0.5F) {
+        midpoint_world = end_point;
+        midpoint_radius = end_radius;
+        midpoint_world_set = true;
+      }
+    }
+
+    const Vector3 probe_tail = Add(ship_world, Scale(tube_direction, -0.65F));
+    const Vector3 probe_nose = Add(ship_world, Scale(tube_direction, 0.65F));
+    DrawCylinderEx(probe_tail, probe_nose, 0.16F, 0.08F, 12, Fade(text, 0.95F));
+    DrawSphereEx(ship_world, 0.15F, 10, 10, Fade(app_background, 0.90F));
+    DrawCylinderEx(acceleration_offset_start, acceleration_vector_end, 0.03F, 0.03F, 10, accent);
+    DrawCylinderEx(Add(acceleration_vector_end, Scale(tube_direction, -0.18F)), acceleration_vector_end, 0.10F, 0.0F, 10,
+                   accent);
+
+    EndMode3D();
+    EndTextureMode();
+
+    DrawPanel(viewport, viewport_background, panel_edge);
+    DrawTexturePro(scene_target.texture, {0.0F, 0.0F, static_cast<float>(scene_target.texture.width),
+                                          -static_cast<float>(scene_target.texture.height)},
+                   viewport, {0.0F, 0.0F}, 0.0F, WHITE);
     DrawRectangleRoundedLinesEx(viewport, 0.015F, 10, 1.0F, panel_edge);
-    DrawPerspectiveGrid(viewport, {viewport.x + viewport.width - 180.0F, viewport.y + 120.0F}, grid);
 
-    DrawUiText(ui_font, "Earth", earth.x - 20.0F, earth.y - 72.0F, 20.0F, structure);
-    DrawUiText(ui_font, "Destination", destination.x - 54.0F, destination.y + 34.0F, 20.0F, structure);
+    DrawPanel(state_panel, Color {19, 23, 29, 215}, Fade(panel_edge, 0.65F));
+    DrawPanel(time_panel, Color {19, 23, 29, 215}, Fade(panel_edge, 0.65F));
 
-    DrawCircleV(earth, 10.0F, structure);
-    DrawCircleV(destination, 8.0F, Fade(structure, 0.88F));
-    DrawLineEx(earth, destination, 1.0F, Fade(structure, 0.18F));
+    DrawUiText(ui_font, "Earth", viewport.x + earth_label.x - 18.0F, viewport.y + earth_label.y - 40.0F, 18.0F, structure);
+    DrawUiText(ui_font, "Destination", viewport.x + destination_label.x - 48.0F, viewport.y + destination_label.y + 18.0F,
+               18.0F, structure);
 
-    const std::size_t stride = std::max<std::size_t>(1, mission.samples.size() / 56);
-    Vector2 previous_upper {};
-    Vector2 previous_lower {};
-    bool has_previous_edges = false;
-    Vector2 previous_upper_completed {};
-    Vector2 previous_lower_completed {};
-    bool has_previous_completed_edges = false;
-    Vector2 midpoint_center {};
-    float midpoint_radius_major = 0.0F;
-    float midpoint_radius_minor = 0.0F;
-    bool midpoint_set = false;
-
-    for (std::size_t index = 0; index < mission.samples.size(); index += stride) {
-      const auto& sample = mission.samples[index];
-      const float sample_t = static_cast<float>(sample.position_ly / mission.profile.distance_ly);
-      const Vector2 center = LerpPoint(earth, destination, sample_t);
-
-      const float perspective = 1.14F - (sample_t * 0.34F);
-      const float gamma_fraction = static_cast<float>((sample.gamma - 1.0) / (mission.summary.gamma - 1.0));
-      const float widening = std::pow(1.0F - gamma_fraction, 2.15F);
-      const float radius_major = (16.0F + (66.0F * widening)) * perspective;
-      const float radius_minor = (6.0F + (24.0F * widening)) * perspective;
-
-      const Color ring_color = Fade(structure, 0.10F + (0.22F * (1.0F - std::abs((sample_t - 0.5F) * 1.3F))));
-      DrawRotatedEllipseLines(center, radius_minor, radius_major, axis_angle + (PI * 0.5F), 40, 1.8F, ring_color);
-
-      const Vector2 upper {center.x + (normal.x * radius_major), center.y + (normal.y * radius_major)};
-      const Vector2 lower {center.x - (normal.x * radius_major), center.y - (normal.y * radius_major)};
-
-      if (has_previous_edges) {
-        DrawLineEx(previous_upper, upper, 1.4F, Fade(structure, 0.22F));
-        DrawLineEx(previous_lower, lower, 1.4F, Fade(structure, 0.22F));
-      }
-
-      previous_upper = upper;
-      previous_lower = lower;
-      has_previous_edges = true;
-
-      if (index <= current_index) {
-        if (has_previous_completed_edges) {
-          DrawLineEx(previous_upper_completed, upper, 2.2F, Fade(accent, 0.44F));
-          DrawLineEx(previous_lower_completed, lower, 2.2F, Fade(accent, 0.44F));
-        }
-
-        previous_upper_completed = upper;
-        previous_lower_completed = lower;
-        has_previous_completed_edges = true;
-        DrawRotatedEllipseLines(center, radius_minor, radius_major, axis_angle + (PI * 0.5F), 40, 2.2F,
-                                Fade(accent, 0.22F));
-      }
-
-      if (!midpoint_set && sample_t >= 0.5F) {
-        midpoint_center = center;
-        midpoint_radius_major = radius_major;
-        midpoint_radius_minor = radius_minor;
-        midpoint_set = true;
-      }
+    if (current.progress >= 0.45) {
+      DrawUiText(ui_font, "Turnaround Event", viewport.x + turnaround_label.x + (midpoint_radius * 18.0F),
+                 viewport.y + turnaround_label.y - 20.0F, 16.0F, text);
+      DrawUiText(ui_font, "maximum Lorentz factor", viewport.x + turnaround_label.x + (midpoint_radius * 18.0F),
+                 viewport.y + turnaround_label.y + 2.0F,
+                 14.0F, muted);
     }
 
-    if (!midpoint_set) {
-      midpoint_center = LerpPoint(earth, destination, 0.5F);
-      midpoint_radius_major = 16.0F;
-      midpoint_radius_minor = 6.0F;
-    }
-
-    DrawRotatedEllipseLines(earth, 11.0F, 84.0F, axis_angle + (PI * 0.5F), 44, 2.8F, Fade(structure, 0.82F));
-    DrawRotatedEllipseLines(destination, 10.0F, 84.0F, axis_angle + (PI * 0.5F), 44, 2.8F, Fade(structure, 0.74F));
-    DrawRotatedEllipseLines(midpoint_center, midpoint_radius_minor, midpoint_radius_major, axis_angle + (PI * 0.5F), 44,
-                            2.8F, accent);
-
-    const Vector2 turnaround_label_anchor {midpoint_center.x + (normal.x * (midpoint_radius_major + 34.0F)),
-                                           midpoint_center.y + (normal.y * (midpoint_radius_major + 34.0F))};
-    DrawLineEx(turnaround_label_anchor, {turnaround_label_anchor.x + 60.0F, turnaround_label_anchor.y - 20.0F}, 1.6F,
-               Fade(accent, 0.75F));
-    DrawUiText(ui_font, "Turnaround Event", turnaround_label_anchor.x + 66.0F, turnaround_label_anchor.y - 34.0F, 18.0F,
-               text);
-    DrawUiText(ui_font, "maximum Lorentz factor", turnaround_label_anchor.x + 66.0F, turnaround_label_anchor.y - 12.0F,
-               16.0F, muted);
-
-    DrawRotatedEllipseLines(ship, 5.5F, 18.0F, axis_angle + (PI * 0.5F), 32, 2.2F, text);
-    DrawLineEx({ship.x - (axis.x * 26.0F), ship.y - (axis.y * 26.0F)},
-               {ship.x + (axis.x * 26.0F), ship.y + (axis.y * 26.0F)}, 5.0F, accent);
-    DrawCircleV(ship, 4.0F, app_background);
-
-    const float accel_length = 30.0F + (58.0F * static_cast<float>(current.beta));
-    const float accel_sign = braking ? -1.0F : 1.0F;
-    DrawArrow({ship.x, ship.y - 46.0F}, {ship.x + (axis.x * accel_length * accel_sign), ship.y - 46.0F + (axis.y * accel_length * accel_sign)},
-              accent, 2.0F);
-
-    const Rectangle earth_rail {viewport.x + viewport.width - 190.0F, viewport.y + 128.0F, 32.0F, 280.0F};
-    const Rectangle traveler_rail {viewport.x + viewport.width - 126.0F, viewport.y + 128.0F, 32.0F, 280.0F};
+    const Rectangle earth_rail {time_panel.x + 22.0F, time_panel.y + 72.0F, 30.0F, 188.0F};
+    const Rectangle traveler_rail {time_panel.x + 82.0F, time_panel.y + 72.0F, 30.0F, 188.0F};
     const float earth_progress = static_cast<float>(current.coordinate_time_years / mission.summary.coordinate_time_years);
     const float traveler_progress = static_cast<float>(current.proper_time_years / mission.summary.coordinate_time_years);
 
-    DrawUiText(ui_font, "Coordinate Time", earth_rail.x - 18.0F, earth_rail.y - 30.0F, 18.0F, muted);
-    DrawUiText(ui_font, "Proper Time", traveler_rail.x - 8.0F, traveler_rail.y - 30.0F, 18.0F, muted);
+    DrawUiText(ui_font, "Temporal Accumulation", time_panel.x + 18.0F, time_panel.y + 16.0F, 17.0F, muted);
+    DrawUiText(ui_font, "Coordinate", earth_rail.x - 12.0F, earth_rail.y - 28.0F, 14.0F, muted);
+    DrawUiText(ui_font, "Proper", traveler_rail.x + 1.0F, traveler_rail.y - 28.0F, 14.0F, muted);
 
     DrawRectangleRounded(earth_rail, 0.2F, 8, Fade(structure, 0.06F));
     DrawRectangleRoundedLinesEx(earth_rail, 0.2F, 8, 1.0F, Fade(structure, 0.40F));
@@ -477,25 +483,26 @@ int main(int argc, char** argv) {
     DrawUiText(ui_font, FormatFixed(current.proper_time_years, 3), traveler_rail.x - 4.0F,
                traveler_rail.y + traveler_rail.height + 12.0F, 18.0F, text);
 
-    DrawUiText(ui_font, "kinematic state", viewport.x + 54.0F, viewport.y + viewport.height - 162.0F, 18.0F, muted);
-    DrawUiText(ui_font, "phase", viewport.x + 54.0F, viewport.y + viewport.height - 132.0F, 18.0F, muted);
-    DrawUiText(ui_font, std::string(PhaseLabel(current.progress)), viewport.x + 132.0F,
-               viewport.y + viewport.height - 132.0F, 18.0F, text);
-    DrawUiText(ui_font, "beta", viewport.x + 54.0F, viewport.y + viewport.height - 102.0F, 18.0F, muted);
-    DrawUiText(ui_font, FormatFixed(current.beta, 3), viewport.x + 132.0F, viewport.y + viewport.height - 102.0F, 18.0F,
+    DrawUiText(ui_font, "Kinematic State", state_panel.x + 18.0F, state_panel.y + 16.0F, 17.0F, muted);
+    DrawUiText(ui_font, "phase", state_panel.x + 18.0F, state_panel.y + 48.0F, 16.0F, muted);
+    DrawUiText(ui_font, std::string(PhaseLabel(current.progress)), state_panel.x + 102.0F, state_panel.y + 48.0F, 16.0F,
                text);
-    DrawUiText(ui_font, "gamma", viewport.x + 54.0F, viewport.y + viewport.height - 72.0F, 18.0F, muted);
-    DrawUiText(ui_font, FormatFixed(current.gamma, 4), viewport.x + 132.0F, viewport.y + viewport.height - 72.0F, 18.0F,
-               text);
-    DrawUiText(ui_font, "delta t", viewport.x + 54.0F, viewport.y + viewport.height - 42.0F, 18.0F, muted);
-    DrawUiText(ui_font, FormatFixed(current.coordinate_time_years - current.proper_time_years, 3) + " y",
-               viewport.x + 132.0F, viewport.y + viewport.height - 42.0F, 18.0F, accent);
+    DrawUiText(ui_font, "beta", state_panel.x + 18.0F, state_panel.y + 78.0F, 16.0F, muted);
+    DrawUiText(ui_font, FormatFixed(current.beta, 3), state_panel.x + 102.0F, state_panel.y + 78.0F, 16.0F, text);
+    DrawUiText(ui_font, "gamma", state_panel.x + 18.0F, state_panel.y + 108.0F, 16.0F, muted);
+    DrawUiText(ui_font, FormatFixed(current.gamma, 4), state_panel.x + 102.0F, state_panel.y + 108.0F, 16.0F, text);
+    DrawUiText(ui_font, "dynamics", state_panel.x + 18.0F, state_panel.y + 138.0F, 16.0F, muted);
+    DrawUiText(ui_font, std::string(DynamicsLabel(current.signed_proper_acceleration_ly_per_year2)), state_panel.x + 102.0F,
+               state_panel.y + 138.0F, 16.0F, text);
 
-    DrawUiText(ui_font, "Larger tube diameter corresponds to lower velocity and faster proper-time accumulation.", 380.0F,
-               viewport.y + viewport.height - 76.0F, 18.0F, muted);
-    DrawUiText(ui_font,
-               "The tube contracts continuously toward the turnaround event, where the Lorentz factor is maximal.", 380.0F,
-               viewport.y + viewport.height - 44.0F, 18.0F, muted);
+    DrawUiText(ui_font, "delta t", time_panel.x + 18.0F, time_panel.y + 274.0F, 15.0F, muted);
+    DrawUiText(ui_font, FormatFixed(current.coordinate_time_years - current.proper_time_years, 3) + " y",
+               time_panel.x + 76.0F, time_panel.y + 274.0F, 15.0F, accent);
+
+    DrawUiText(ui_font, "The world-tube is generated only by the completed trajectory.", 380.0F,
+               viewport.y + viewport.height - 72.0F, 17.0F, muted);
+    DrawUiText(ui_font, "Tube contraction tracks the rise in Lorentz factor toward the turnaround event.", 380.0F,
+               viewport.y + viewport.height - 42.0F, 17.0F, muted);
 
     DrawRectangleRounded(controls, 0.04F, 10, viewport_background);
     DrawRectangleRoundedLinesEx(controls, 0.04F, 10, 1.0F, panel_edge);
@@ -522,6 +529,7 @@ int main(int argc, char** argv) {
   if (custom_font_loaded) {
     UnloadFont(ui_font);
   }
+  UnloadRenderTexture(scene_target);
 
   CloseWindow();
   return 0;
