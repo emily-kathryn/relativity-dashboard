@@ -2,4 +2,6 @@ build/
 out/
 *.swp
 *.DS_Store
-
+AGENTS.md
+GEMINI.md
+AI_CONTEXT.md

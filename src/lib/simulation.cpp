@@ -1,5 +1,6 @@
 #include "relativity/simulation.hpp"
 
+#include <array>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -9,6 +10,13 @@
 namespace relativity {
 
 namespace {
+
+constexpr std::array<MissionPreset, 4> kMissionPresets {{
+    {"alpha-centauri", "Alpha Centauri", 4.37, 0.80},
+    {"barnards-star", "Barnard's Star", 5.96, 0.80},
+    {"sirius", "Sirius", 8.61, 0.85},
+    {"trappist-1", "TRAPPIST-1", 39.50, 0.95},
+}};
 
 void ValidateProfile(const MissionProfile& profile) {
   if (!(profile.distance_ly > 0.0) || !std::isfinite(profile.distance_ly)) {
@@ -32,6 +40,27 @@ double LorentzGamma(double beta) {
   }
 
   return 1.0 / std::sqrt(1.0 - (beta * beta));
+}
+
+double ProperTimeRate(double gamma) {
+  if (!(gamma >= 1.0) || !std::isfinite(gamma)) {
+    throw std::invalid_argument("gamma must be finite and satisfy gamma >= 1");
+  }
+
+  return 1.0 / gamma;
+}
+
+std::vector<MissionPreset> MissionPresets() {
+  return {kMissionPresets.begin(), kMissionPresets.end()};
+}
+
+std::optional<MissionPreset> FindMissionPreset(std::string_view id) {
+  for (const auto& preset : kMissionPresets) {
+    if (preset.id == id) {
+      return preset;
+    }
+  }
+  return std::nullopt;
 }
 
 MissionResult SimulateMission(const MissionProfile& profile) {
@@ -104,6 +133,7 @@ MissionResult SimulateMission(const MissionProfile& profile) {
         .proper_time_years = proper_time,
         .position_ly = position_ly,
         .gamma = gamma,
+        .proper_time_rate = ProperTimeRate(gamma),
         .beta = beta,
         .rapidity = rapidity,
         .signed_proper_acceleration_ly_per_year2 = signed_proper_acceleration,

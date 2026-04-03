@@ -21,6 +21,7 @@ void Expect(bool condition, const std::string& message) {
 void TestLorentzGamma() {
   const double gamma = relativity::LorentzGamma(0.8);
   Expect(NearlyEqual(gamma, 1.6666666666666667), "gamma(0.8) should be 5/3");
+  Expect(NearlyEqual(relativity::ProperTimeRate(gamma), 0.6), "proper-time rate should be 1/gamma");
 }
 
 void TestMissionSummary() {
@@ -38,8 +39,17 @@ void TestMissionSummary() {
   Expect(result.samples.size() == 5, "sample count mismatch");
   Expect(NearlyEqual(result.samples.back().position_ly, 4.37), "final position mismatch");
   Expect(NearlyEqual(result.samples.front().beta, 0.0), "initial beta mismatch");
+  Expect(NearlyEqual(result.samples.front().proper_time_rate, 1.0), "initial proper-time rate mismatch");
   Expect(NearlyEqual(result.samples[2].beta, 0.8, 1e-9), "midpoint peak beta mismatch");
+  Expect(NearlyEqual(result.samples[2].proper_time_rate, 0.6, 1e-9), "midpoint proper-time rate mismatch");
   Expect(NearlyEqual(result.samples.back().beta, 0.0, 1e-9), "final beta mismatch");
+}
+
+void TestMissionPresets() {
+  const auto preset = relativity::FindMissionPreset("alpha-centauri");
+  Expect(preset.has_value(), "alpha-centauri preset should exist");
+  Expect(NearlyEqual(preset->distance_ly, 4.37), "alpha-centauri distance mismatch");
+  Expect(!relativity::FindMissionPreset("unknown").has_value(), "unknown preset should not exist");
 }
 
 void TestInvalidInput() {
@@ -63,6 +73,7 @@ int main() {
   try {
     TestLorentzGamma();
     TestMissionSummary();
+    TestMissionPresets();
     TestInvalidInput();
     std::cout << "All relativity tests passed.\n";
     return EXIT_SUCCESS;

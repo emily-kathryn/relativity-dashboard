@@ -41,9 +41,10 @@ For a one-way mission with total Earth-frame distance `D` and midpoint peak spee
 
 The visualizer now renders a single cinematic scene:
 
-- two synchronized clocks that visibly drift apart
+- a proper-time-rate world-tube whose radius follows `dτ/dt = 1 / gamma`
+- traveler proper-time pulse rings and Earth-frame coordinate-time pulse rings
 - a ship accelerating away from Earth and braking toward the destination
-- pulse rings and aging bars that show Earth time accumulating faster
+- frame-specific overlays for Earth-frame and traveler-frame quantities
 - direct playback controls and a mission-stage scrubber
 
 ## Project Layout
@@ -82,11 +83,19 @@ CLI example:
 ./build/relativity_cli --distance 4.37 --beta 0.8
 ```
 
+CLI preset example:
+
+```bash
+./build/relativity_cli --destination alpha-centauri
+```
+
 Export worldline samples as CSV:
 
 ```bash
 ./build/relativity_cli --distance 4.37 --beta 0.8 --samples 600 --csv mission.csv
 ```
+
+CSV columns include sampled coordinate time, proper time, `gamma`, proper-time rate `dτ/dt`, and return-signal time.
 
 Run tests:
 
@@ -100,14 +109,49 @@ Launch the visualizer:
 ./build/relativity_visualizer --distance 4.37 --beta 0.8
 ```
 
+Launch the visualizer with a named destination preset:
+
+```bash
+./build/relativity_visualizer --destination trappist-1
+```
+
+Export a mission summary PNG and mission visual PNG:
+
+```bash
+./build/relativity_visualizer --destination alpha-centauri --export-prefix exports/alpha_centauri
+```
+
+This writes:
+
+- `exports/alpha_centauri_summary.png`
+- `exports/alpha_centauri_visual.png`
+
 Visualizer controls:
 
 - click `Play` or press `Space` to start or pause travel
 - click `Reset` or press `Home` to return to departure
 - drag the slider to choose the mission stage directly
 - `Left` / `Right`: scrub backward or forward
-- mouse wheel: fine stage adjustments
+- mouse wheel outside the viewport: fine stage adjustments
+- mouse wheel over the viewport: 3D zoom
+- right-drag in the viewport: orbit camera
+- middle-drag in the viewport: pan camera
+- `C`: reset camera
+- `E`: export `mission_export_summary.png` and `mission_export_visual.png` from the current view
 - `End`: jump to arrival
+
+Available destination presets:
+
+- `alpha-centauri`
+- `barnards-star`
+- `sirius`
+- `trappist-1`
+
+If a preset is selected without `--distance` or `--beta`, the preset distance and suggested beta are used.
+
+## Scope Note
+
+The mission presets and visualizer remain special-relativistic only. Earth and the destination are assumed to be stationary in one inertial frame. Distances on the order of millions of light-years require cosmological expansion and curved-spacetime modeling, which this project does not yet implement.
 
 ## Next Physics Steps
 
