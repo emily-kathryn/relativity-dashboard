@@ -32,6 +32,94 @@ void ValidateProfile(const MissionProfile& profile) {
   }
 }
 
+struct IntegratorState {
+  double proper_time_years {};
+  double coordinate_time_years {};
+  double position_ly {};
+  double rapidity {};
+};
+
+struct StateDerivative {
+  double proper_time_years {};
+  double coordinate_time_years {};
+  double position_ly {};
+  double rapidity {};
+};
+
+IntegratorState AddScaled(const IntegratorState& state, const StateDerivative& derivative, double scale) {
+  return {
+      .proper_time_years = state.proper_time_years + (derivative.proper_time_years * scale),
+      .coordinate_time_years = state.coordinate_time_years + (derivative.coordinate_time_years * scale),
+      .position_ly = state.position_ly + (derivative.position_ly * scale),
+      .rapidity = state.rapidity + (derivative.rapidity * scale),
+  };
+}
+
+StateDerivative EvaluateDerivative(const IntegratorState& state, double signed_proper_acceleration_ly_per_year2) {
+  return {
+      .proper_time_years = 1.0,
+      .coordinate_time_years = std::cosh(state.rapidity),
+      .position_ly = std::sinh(state.rapidity),
+      .rapidity = signed_proper_acceleration_ly_per_year2,
+  };
+}
+
+IntegratorState AdvanceStateRk4(const IntegratorState& initial_state, double step_years,
+                                double signed_proper_acceleration_ly_per_year2) {
+  const StateDerivative k1 = EvaluateDerivative(initial_state, signed_proper_acceleration_ly_per_year2);
+  const StateDerivative k2 =
+      EvaluateDerivative(AddScaled(initial_state, k1, step_years * 0.5), signed_proper_acceleration_ly_per_year2);
+  const StateDerivative k3 =
+      EvaluateDerivative(AddScaled(initial_state, k2, step_years * 0.5), signed_proper_acceleration_ly_per_year2);
+  const StateDerivative k4 =
+      EvaluateDerivative(AddScaled(initial_state, k3, step_years), signed_proper_acceleration_ly_per_year2);
+
+  return {
+      .proper_time_years = initial_state.proper_time_years +
+                           (step_years / 6.0) *
+                               (k1.proper_time_years + (2.0 * k2.proper_time_years) + (2.0 * k3.proper_time_years) +
+                                k4.proper_time_years),
+      .coordinate_time_years = initial_state.coordinate_time_years +
+                               (step_years / 6.0) *
+                                   (k1.coordinate_time_years + (2.0 * k2.coordinate_time_years) +
+                                    (2.0 * k3.coordinate_time_years) + k4.coordinate_time_years),
+      .position_ly = initial_state.position_ly +
+                     (step_years / 6.0) *
+                         (k1.position_ly + (2.0 * k2.position_ly) + (2.0 * k3.position_ly) + k4.position_ly),
+      .rapidity =
+          initial_state.rapidity +
+          (step_years / 6.0) * (k1.rapidity + (2.0 * k2.rapidity) + (2.0 * k3.rapidity) + k4.rapidity),
+  };
+}
+
+IntegratorState IntegrateToProperTime(IntegratorState state, double target_proper_time_years, double max_step_years,
+                                      double half_proper_time_years, double proper_acceleration_ly_per_year2) {
+  constexpr double kTimeEpsilon = 1e-12;
+
+  while (state.proper_time_years + kTimeEpsilon < target_proper_time_years) {
+    const double signed_proper_acceleration =
+        state.proper_time_years < half_proper_time_years ? proper_acceleration_ly_per_year2 : -proper_acceleration_ly_per_year2;
+    double step_years = std::min(max_step_years, target_proper_time_years - state.proper_time_years);
+
+    if (state.proper_time_years < half_proper_time_years &&
+        state.proper_time_years + step_years > half_proper_time_years + kTimeEpsilon) {
+      step_years = half_proper_time_years - state.proper_time_years;
+    }
+
+    state = AdvanceStateRk4(state, step_years, signed_proper_acceleration);
+  }
+
+  const double remaining_step_years = target_proper_time_years - state.proper_time_years;
+  if (remaining_step_years > kTimeEpsilon) {
+    const double signed_proper_acceleration =
+        state.proper_time_years < half_proper_time_years ? proper_acceleration_ly_per_year2 : -proper_acceleration_ly_per_year2;
+    state = AdvanceStateRk4(state, remaining_step_years, signed_proper_acceleration);
+  }
+
+  state.proper_time_years = target_proper_time_years;
+  return state;
+}
+
 }  // namespace
 
 double LorentzGamma(double beta) {
@@ -70,76 +158,58 @@ MissionResult SimulateMission(const MissionProfile& profile) {
   const double peak_rapidity = std::atanh(profile.beta);
   const double half_distance_ly = profile.distance_ly * 0.5;
   const double proper_acceleration = (peak_gamma - 1.0) / half_distance_ly;
-  const double half_coordinate_time_years = std::sinh(peak_rapidity) / proper_acceleration;
   const double half_proper_time_years = peak_rapidity / proper_acceleration;
-  const double coordinate_time_years = half_coordinate_time_years * 2.0;
   const double proper_time_years = half_proper_time_years * 2.0;
-  const double elapsed_difference_years = coordinate_time_years - proper_time_years;
-  const double arrival_signal_to_earth_years = coordinate_time_years + profile.distance_ly;
+  const std::size_t integration_step_count = std::max<std::size_t>(profile.sample_count * 16, 65536);
+  const double max_step_years = proper_time_years / static_cast<double>(integration_step_count);
 
   MissionResult result {
       .profile = profile,
-      .summary =
-          {
-              .gamma = peak_gamma,
-              .peak_beta = profile.beta,
-              .proper_acceleration_ly_per_year2 = proper_acceleration,
-              .coordinate_time_years = coordinate_time_years,
-              .proper_time_years = proper_time_years,
-              .elapsed_difference_years = elapsed_difference_years,
-              .one_way_light_time_years = profile.distance_ly,
-              .arrival_signal_to_earth_years = arrival_signal_to_earth_years,
-          },
+      .summary = {},
       .samples = {},
   };
 
   result.samples.reserve(profile.sample_count);
+  IntegratorState state {};
 
   for (std::size_t index = 0; index < profile.sample_count; ++index) {
     const double progress = static_cast<double>(index) /
                             static_cast<double>(profile.sample_count - 1);
-    const double proper_time = proper_time_years * progress;
+    const double target_proper_time_years = proper_time_years * progress;
+    state = IntegrateToProperTime(state, target_proper_time_years, max_step_years, half_proper_time_years,
+                                  proper_acceleration);
 
-    double rapidity = 0.0;
-    double gamma = 1.0;
-    double beta = 0.0;
-    double coordinate_time = 0.0;
-    double position_ly = 0.0;
-    double signed_proper_acceleration = proper_acceleration;
-
-    if (proper_time <= half_proper_time_years) {
-      rapidity = proper_acceleration * proper_time;
-      gamma = std::cosh(rapidity);
-      beta = std::tanh(rapidity);
-      coordinate_time = std::sinh(rapidity) / proper_acceleration;
-      position_ly = (gamma - 1.0) / proper_acceleration;
-      signed_proper_acceleration = proper_acceleration;
-    } else {
-      const double post_midpoint_proper = proper_time - half_proper_time_years;
-      rapidity = peak_rapidity - (proper_acceleration * post_midpoint_proper);
-      gamma = std::cosh(rapidity);
-      beta = std::tanh(rapidity);
-      coordinate_time = half_coordinate_time_years +
-                        ((std::sinh(peak_rapidity) - std::sinh(rapidity)) / proper_acceleration);
-      position_ly = half_distance_ly + ((peak_gamma - gamma) / proper_acceleration);
-      signed_proper_acceleration = -proper_acceleration;
-    }
-
-    const double signal_return_to_earth = coordinate_time + position_ly;
+    const double gamma = std::cosh(state.rapidity);
+    const double beta = std::tanh(state.rapidity);
+    const double signed_proper_acceleration =
+        state.proper_time_years <= half_proper_time_years ? proper_acceleration : -proper_acceleration;
+    const double signal_return_to_earth = state.coordinate_time_years + state.position_ly;
 
     result.samples.push_back(WorldlineSample {
         .progress = progress,
-        .coordinate_time_years = coordinate_time,
-        .proper_time_years = proper_time,
-        .position_ly = position_ly,
+        .coordinate_time_years = state.coordinate_time_years,
+        .proper_time_years = state.proper_time_years,
+        .position_ly = state.position_ly,
         .gamma = gamma,
         .proper_time_rate = ProperTimeRate(gamma),
         .beta = beta,
-        .rapidity = rapidity,
+        .rapidity = state.rapidity,
         .signed_proper_acceleration_ly_per_year2 = signed_proper_acceleration,
         .signal_return_to_earth_years = signal_return_to_earth,
     });
   }
+
+  const auto& final_sample = result.samples.back();
+  result.summary = {
+      .gamma = peak_gamma,
+      .peak_beta = profile.beta,
+      .proper_acceleration_ly_per_year2 = proper_acceleration,
+      .coordinate_time_years = final_sample.coordinate_time_years,
+      .proper_time_years = proper_time_years,
+      .elapsed_difference_years = final_sample.coordinate_time_years - proper_time_years,
+      .one_way_light_time_years = profile.distance_ly,
+      .arrival_signal_to_earth_years = final_sample.signal_return_to_earth_years,
+  };
 
   return result;
 }

@@ -3,6 +3,7 @@
 #include "raylib.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -19,7 +20,7 @@ constexpr int kMaximumLights = 4;
 
 struct ShaderLight {
   int type {};
-  bool enabled {};
+  int enabled {};
   Vector3 position {};
   Vector3 target {};
   Color color {};
@@ -103,6 +104,122 @@ void main()
 }
 )glsl";
 
+constexpr const char* kCockpitVertexShader = R"glsl(
+#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec4 vertexColor;
+uniform mat4 mvp;
+out vec2 fragTexCoord;
+out vec4 fragColor;
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    gl_Position = mvp*vec4(vertexPosition, 1.0);
+}
+)glsl";
+
+constexpr const char* kCockpitFragmentShader = R"glsl(
+#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+out vec4 finalColor;
+
+uniform vec2 resolution;
+uniform float beta;
+uniform float gamma;
+uniform vec3 cameraForward;
+uniform vec3 cameraRight;
+uniform vec3 cameraUp;
+uniform float fovyRadians;
+uniform float aspectRatio;
+
+const float PI = 3.14159265359;
+
+float Hash12(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+vec3 SafePerpendicular(vec3 axis)
+{
+    vec3 basis = abs(axis.y) < 0.98 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    return normalize(cross(axis, basis));
+}
+
+vec3 InverseAberration(vec3 observedDir)
+{
+    vec3 velocityDir = normalize(cameraForward);
+    float cosObserved = clamp(dot(observedDir, velocityDir), -1.0, 1.0);
+    vec3 perpendicular = observedDir - velocityDir * cosObserved;
+    float perpendicularLength = length(perpendicular);
+    vec3 perpendicularDir = perpendicularLength > 1e-5 ? perpendicular / perpendicularLength : SafePerpendicular(velocityDir);
+    float denominator = max(1.0 - beta * cosObserved, 1e-5);
+    float cosWorld = clamp((cosObserved - beta) / denominator, -1.0, 1.0);
+    float sinWorld = sqrt(max(0.0, 1.0 - cosWorld * cosWorld));
+    return normalize((velocityDir * cosWorld) + (perpendicularDir * sinWorld));
+}
+
+vec3 DopplerTint(float factor, float seed)
+{
+    float shift = clamp(0.5 + 0.28 * log2(max(factor, 0.125)), 0.0, 1.0);
+    vec3 warm = vec3(1.0, 0.54, 0.30);
+    vec3 cool = vec3(0.57, 0.72, 1.0);
+    vec3 base = mix(vec3(1.0, 0.90, 0.82), vec3(0.78, 0.88, 1.0), seed);
+    return mix(warm, cool, shift) * base;
+}
+
+float StarLayer(vec3 worldDir, vec2 scale, float threshold, float radiusScale, out float seed)
+{
+    float azimuth = atan(worldDir.z, worldDir.x) / (2.0 * PI) + 0.5;
+    float polar = acos(clamp(worldDir.y, -1.0, 1.0)) / PI;
+    vec2 grid = vec2(azimuth, polar) * scale;
+    vec2 cell = floor(grid);
+    vec2 local = fract(grid) - 0.5;
+    seed = Hash12(cell);
+    vec2 offset = vec2(Hash12(cell + 7.2), Hash12(cell + 19.4)) - 0.5;
+    float distanceToStar = length(local - offset * 0.62);
+    float sparkle = smoothstep(0.055 * radiusScale, 0.0, distanceToStar);
+    float star = seed > threshold ? sparkle * (0.35 + seed * 0.9) : 0.0;
+    if (seed > threshold + 0.01) {
+        star += smoothstep(0.14 * radiusScale, 0.0, distanceToStar) * 0.12;
+    }
+    return star;
+}
+
+void main()
+{
+    vec2 uv = fragTexCoord * 2.0 - 1.0;
+    uv.x *= aspectRatio;
+    float focalScale = tan(fovyRadians * 0.5);
+    vec3 observedDir = normalize(cameraForward + (uv.x * focalScale * cameraRight) + (uv.y * focalScale * cameraUp));
+    vec3 worldDir = InverseAberration(observedDir);
+
+    float cosTheta = clamp(dot(worldDir, normalize(cameraForward)), -1.0, 1.0);
+    float doppler = 1.0 / max(gamma * (1.0 - beta * cosTheta), 1e-4);
+    float beaming = min(pow(doppler, 4.0), 15.0);
+
+    float seedA = 0.0;
+    float seedB = 0.0;
+    float starA = StarLayer(worldDir, vec2(180.0, 96.0), 0.992, 1.00, seedA);
+    float starB = StarLayer(worldDir, vec2(320.0, 176.0), 0.997, 0.72, seedB);
+    float starIntensity = (starA + starB) * beaming;
+
+    float horizonGlow = pow(max(0.0, 1.0 - abs(worldDir.y)), 7.0) * 0.025;
+    float forwardGlow = pow(max(0.0, cosTheta), 10.0) * 0.06 * beaming;
+    vec3 background = vec3(0.006, 0.008, 0.012) + horizonGlow * vec3(0.10, 0.11, 0.14) +
+                      forwardGlow * vec3(0.18, 0.20, 0.26);
+
+    vec3 starColor = starA * DopplerTint(doppler, seedA) + starB * DopplerTint(doppler, seedB);
+    vec3 color = background + starColor * starIntensity;
+
+    finalColor = vec4(clamp(color, 0.0, 1.0), 1.0) * fragColor;
+}
+)glsl";
+
 struct CliOptions {
   double distance_ly {4.37};
   double beta {0.8};
@@ -132,10 +249,47 @@ enum class TimeDomain {
   Proper,
 };
 
+enum class ViewMode {
+  ThirdPerson,
+  Cockpit,
+};
+
 struct PulseMarker {
   double time_years {};
   float path_fraction {};
   float proper_time_rate_radius {};
+};
+
+struct AppColors {
+  Color app_background {};
+  Color viewport_background {};
+  Color panel_edge {};
+  Color grid {};
+  Color text {};
+  Color muted {};
+  Color structure {};
+  Color earth_frame {};
+  Color traveler_frame {};
+  Color earth_body {};
+  Color destination_body {};
+  Color warning {};
+};
+
+struct UiLayout {
+  Rectangle viewport {};
+  Rectangle controls {};
+  Rectangle play_button {};
+  Rectangle reset_button {};
+  Rectangle slider_track {};
+  Rectangle mission_panel {};
+  Rectangle frames_panel {};
+  Rectangle simultaneity_panel {};
+};
+
+struct SceneLabels {
+  Vector2 earth {};
+  Vector2 destination {};
+  Vector2 turnaround {};
 };
 
 double ParseDouble(const std::string_view text, const std::string_view name) {
@@ -284,17 +438,21 @@ bool ButtonClicked(const Rectangle& bounds, const Vector2 mouse) {
   return IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, bounds);
 }
 
+void DrawPanel(const Rectangle& bounds, Color fill, Color outline) {
+  DrawRectangleRounded(bounds, 0.12F, 10, fill);
+  DrawRectangleRoundedLinesEx(bounds, 0.12F, 10, 1.0F, outline);
+}
+
 void DrawButton(const Font& font, const Rectangle& bounds, const char* label, bool active, bool hover, Color fill,
                 Color outline, Color text_color) {
   const Color background = active ? fill : (hover ? Fade(fill, 0.84F) : Fade(fill, 0.58F));
   DrawRectangleRounded(bounds, 0.18F, 10, background);
   DrawRectangleRoundedLinesEx(bounds, 0.18F, 10, 1.0F, outline);
 
-  const int font_size = 18;
-  const float text_width = MeasureUiText(font, label, static_cast<float>(font_size));
+  constexpr float kFontSize = 18.0F;
+  const float text_width = MeasureUiText(font, label, kFontSize);
   DrawUiText(font, label, bounds.x + ((bounds.width - text_width) * 0.5F),
-             bounds.y + ((bounds.height - static_cast<float>(font_size)) * 0.5F), static_cast<float>(font_size),
-             text_color);
+             bounds.y + ((bounds.height - kFontSize) * 0.5F), kFontSize, text_color);
 }
 
 float SliderStageFromMouse(const Rectangle& slider_track, const Vector2 mouse_position) {
@@ -339,6 +497,14 @@ Vector3 Cross(Vector3 left, Vector3 right) {
       (left.z * right.x) - (left.x * right.z),
       (left.x * right.y) - (left.y * right.x),
   };
+}
+
+Vector3 RotateAroundAxis(Vector3 value, Vector3 axis, float angle_radians) {
+  const Vector3 normalized_axis = Normalize(axis);
+  const float cosine = std::cos(angle_radians);
+  const float sine = std::sin(angle_radians);
+  return Add(Add(Scale(value, cosine), Scale(Cross(normalized_axis, value), sine)),
+             Scale(normalized_axis, Dot(normalized_axis, value) * (1.0F - cosine)));
 }
 
 Vector3 QuadraticBezierPoint(Vector3 start, Vector3 control, Vector3 end, float amount) {
@@ -492,7 +658,7 @@ void UpdateShaderLight(Shader shader, const ShaderLight& light) {
 
 ShaderLight CreateShaderLight(int index, int type, Vector3 position, Vector3 target, Color color, Shader shader) {
   ShaderLight light {};
-  light.enabled = true;
+  light.enabled = 1;
   light.type = type;
   light.position = position;
   light.target = target;
@@ -504,11 +670,6 @@ ShaderLight CreateShaderLight(int index, int type, Vector3 position, Vector3 tar
   light.color_location = GetShaderLocation(shader, TextFormat("lights[%i].color", index));
   UpdateShaderLight(shader, light);
   return light;
-}
-
-void DrawPanel(const Rectangle& bounds, Color fill, Color outline) {
-  DrawRectangleRounded(bounds, 0.12F, 10, fill);
-  DrawRectangleRoundedLinesEx(bounds, 0.12F, 10, 1.0F, outline);
 }
 
 const char* DynamicsLabel(double signed_proper_acceleration) {
@@ -649,83 +810,87 @@ void DrawSummaryLine(const Font& font, std::string_view label, const std::string
   DrawUiText(font, value, x + width - value_width, y, 22.0F, value_color);
 }
 
+double DelayedObservationTimeYears(const relativity::WorldlineSample& sample) {
+  return sample.coordinate_time_years - sample.position_ly;
+}
+
 void DrawMissionSummaryCard(const Font& ui_font, const relativity::MissionResult& mission, const std::string& mission_name,
                             const std::string& destination_name, double coordinate_pulse_interval,
-                            double proper_pulse_interval, bool cosmology_note, Color app_background,
-                            Color viewport_background, Color panel_edge, Color text, Color muted, Color earth_frame,
-                            Color traveler_frame, Color warning) {
+                            double proper_pulse_interval, bool cosmology_note, const AppColors& colors) {
   const Rectangle card {36.0F, 36.0F, 952.0F, 568.0F};
-  DrawRectangleGradientV(0, 0, 1024, 640, app_background, viewport_background);
-  DrawPanel(card, Color {19, 23, 29, 236}, Fade(panel_edge, 0.80F));
+  DrawRectangleGradientV(0, 0, 1024, 640, colors.app_background, colors.viewport_background);
+  DrawPanel(card, Color {19, 23, 29, 236}, Fade(colors.panel_edge, 0.80F));
 
-  DrawUiText(ui_font, "Relativity Mission Summary", card.x + 28.0F, card.y + 24.0F, 34.0F, text);
-  DrawUiText(ui_font, mission_name, card.x + 30.0F, card.y + 72.0F, 22.0F, traveler_frame);
-  DrawUiText(ui_font, destination_name, card.x + 30.0F, card.y + 104.0F, 20.0F, muted);
+  DrawUiText(ui_font, "Relativity Mission Summary", card.x + 28.0F, card.y + 24.0F, 34.0F, colors.text);
+  DrawUiText(ui_font, mission_name, card.x + 30.0F, card.y + 72.0F, 22.0F, colors.traveler_frame);
+  DrawUiText(ui_font, destination_name, card.x + 30.0F, card.y + 104.0F, 20.0F, colors.muted);
 
   const float metrics_x = card.x + 30.0F;
   const float metrics_y = card.y + 154.0F;
   const float metrics_width = 388.0F;
 
   DrawSummaryLine(ui_font, "distance", FormatFixed(mission.profile.distance_ly, 2) + " ly", metrics_x, metrics_y,
-                  metrics_width, muted, text);
+                  metrics_width, colors.muted, colors.text);
   DrawSummaryLine(ui_font, "peak beta", FormatFixed(mission.summary.peak_beta, 3), metrics_x, metrics_y + 38.0F,
-                  metrics_width, muted, text);
+                  metrics_width, colors.muted, colors.text);
   DrawSummaryLine(ui_font, "peak Lorentz factor", FormatFixed(mission.summary.gamma, 4), metrics_x, metrics_y + 76.0F,
-                  metrics_width, muted, text);
-  DrawSummaryLine(ui_font, "proper acceleration", FormatFixed(mission.summary.proper_acceleration_ly_per_year2, 3) + " ly / y^2",
-                  metrics_x, metrics_y + 114.0F, metrics_width, muted, text);
+                  metrics_width, colors.muted, colors.text);
+  DrawSummaryLine(ui_font, "proper acceleration",
+                  FormatFixed(mission.summary.proper_acceleration_ly_per_year2, 3) + " ly / y^2", metrics_x,
+                  metrics_y + 114.0F, metrics_width, colors.muted, colors.text);
   DrawSummaryLine(ui_font, "coordinate time", FormatFixed(mission.summary.coordinate_time_years, 3) + " y",
-                  metrics_x, metrics_y + 174.0F, metrics_width, earth_frame, earth_frame);
-  DrawSummaryLine(ui_font, "proper time", FormatFixed(mission.summary.proper_time_years, 3) + " y",
-                  metrics_x, metrics_y + 212.0F, metrics_width, traveler_frame, traveler_frame);
+                  metrics_x, metrics_y + 174.0F, metrics_width, colors.earth_frame, colors.earth_frame);
+  DrawSummaryLine(ui_font, "proper time", FormatFixed(mission.summary.proper_time_years, 3) + " y", metrics_x,
+                  metrics_y + 212.0F, metrics_width, colors.traveler_frame, colors.traveler_frame);
   DrawSummaryLine(ui_font, "elapsed difference", FormatFixed(mission.summary.elapsed_difference_years, 3) + " y",
-                  metrics_x, metrics_y + 250.0F, metrics_width, traveler_frame, traveler_frame);
-  DrawSummaryLine(ui_font, "arrival signal to Earth", FormatFixed(mission.summary.arrival_signal_to_earth_years, 3) + " y",
-                  metrics_x, metrics_y + 288.0F, metrics_width, earth_frame, earth_frame);
+                  metrics_x, metrics_y + 250.0F, metrics_width, colors.traveler_frame, colors.traveler_frame);
+  DrawSummaryLine(ui_font, "arrival signal to Earth",
+                  FormatFixed(mission.summary.arrival_signal_to_earth_years, 3) + " y", metrics_x, metrics_y + 288.0F,
+                  metrics_width, colors.earth_frame, colors.earth_frame);
 
   const Rectangle frame_box {card.x + 500.0F, card.y + 150.0F, 420.0F, 266.0F};
-  DrawPanel(frame_box, Color {14, 17, 21, 220}, Fade(panel_edge, 0.65F));
-  DrawUiText(ui_font, "Frame Comparison", frame_box.x + 22.0F, frame_box.y + 18.0F, 24.0F, text);
-  DrawUiText(ui_font, "Earth frame", frame_box.x + 52.0F, frame_box.y + 62.0F, 20.0F, earth_frame);
-  DrawUiText(ui_font, "Traveler frame", frame_box.x + 232.0F, frame_box.y + 62.0F, 20.0F, traveler_frame);
+  DrawPanel(frame_box, Color {14, 17, 21, 220}, Fade(colors.panel_edge, 0.65F));
+  DrawUiText(ui_font, "Frame Comparison", frame_box.x + 22.0F, frame_box.y + 18.0F, 24.0F, colors.text);
+  DrawUiText(ui_font, "Earth frame", frame_box.x + 52.0F, frame_box.y + 62.0F, 20.0F, colors.earth_frame);
+  DrawUiText(ui_font, "Traveler frame", frame_box.x + 232.0F, frame_box.y + 62.0F, 20.0F, colors.traveler_frame);
 
   const Rectangle earth_rail {frame_box.x + 70.0F, frame_box.y + 102.0F, 48.0F, 118.0F};
   const Rectangle traveler_rail {frame_box.x + 274.0F, frame_box.y + 102.0F, 48.0F, 118.0F};
-  DrawRectangleRounded(earth_rail, 0.2F, 8, Fade(earth_frame, 0.08F));
-  DrawRectangleRoundedLinesEx(earth_rail, 0.2F, 8, 1.0F, Fade(earth_frame, 0.45F));
-  DrawRectangleRounded({earth_rail.x, earth_rail.y, earth_rail.width, earth_rail.height}, 0.2F, 8, Fade(earth_frame, 0.30F));
+  DrawRectangleRounded(earth_rail, 0.2F, 8, Fade(colors.earth_frame, 0.08F));
+  DrawRectangleRoundedLinesEx(earth_rail, 0.2F, 8, 1.0F, Fade(colors.earth_frame, 0.45F));
+  DrawRectangleRounded({earth_rail.x, earth_rail.y, earth_rail.width, earth_rail.height}, 0.2F, 8,
+                       Fade(colors.earth_frame, 0.30F));
 
   const float traveler_fill = static_cast<float>(mission.summary.proper_time_years / mission.summary.coordinate_time_years);
-  DrawRectangleRounded(traveler_rail, 0.2F, 8, Fade(traveler_frame, 0.08F));
-  DrawRectangleRoundedLinesEx(traveler_rail, 0.2F, 8, 1.0F, Fade(traveler_frame, 0.48F));
-  DrawRectangleRounded({traveler_rail.x, traveler_rail.y + traveler_rail.height - (traveler_rail.height * traveler_fill),
-                        traveler_rail.width, traveler_rail.height * traveler_fill},
-                       0.2F, 8, Fade(traveler_frame, 0.34F));
+  DrawRectangleRounded(traveler_rail, 0.2F, 8, Fade(colors.traveler_frame, 0.08F));
+  DrawRectangleRoundedLinesEx(traveler_rail, 0.2F, 8, 1.0F, Fade(colors.traveler_frame, 0.48F));
+  DrawRectangleRounded(
+      {traveler_rail.x, traveler_rail.y + traveler_rail.height - (traveler_rail.height * traveler_fill),
+       traveler_rail.width, traveler_rail.height * traveler_fill},
+      0.2F, 8, Fade(colors.traveler_frame, 0.34F));
 
-  DrawUiText(ui_font, FormatFixed(mission.summary.coordinate_time_years, 2) + " y", earth_rail.x - 14.0F, earth_rail.y + 136.0F,
-             18.0F, earth_frame);
+  DrawUiText(ui_font, FormatFixed(mission.summary.coordinate_time_years, 2) + " y", earth_rail.x - 14.0F,
+             earth_rail.y + 136.0F, 18.0F, colors.earth_frame);
   DrawUiText(ui_font, FormatFixed(mission.summary.proper_time_years, 2) + " y", traveler_rail.x - 14.0F,
-             traveler_rail.y + 136.0F, 18.0F, traveler_frame);
+             traveler_rail.y + 136.0F, 18.0F, colors.traveler_frame);
 
-  DrawUiText(ui_font, "proper pulse interval", frame_box.x + 22.0F, frame_box.y + 234.0F, 18.0F, muted);
+  DrawUiText(ui_font, "proper pulse interval", frame_box.x + 22.0F, frame_box.y + 234.0F, 18.0F, colors.muted);
   DrawUiText(ui_font, FormatFixed(proper_pulse_interval, proper_pulse_interval < 1.0 ? 2 : 1) + " y",
-             frame_box.x + 286.0F, frame_box.y + 234.0F, 18.0F, traveler_frame);
-  DrawUiText(ui_font, "coordinate pulse interval", frame_box.x + 22.0F, frame_box.y + 262.0F, 18.0F, muted);
+             frame_box.x + 286.0F, frame_box.y + 234.0F, 18.0F, colors.traveler_frame);
+  DrawUiText(ui_font, "coordinate pulse interval", frame_box.x + 22.0F, frame_box.y + 262.0F, 18.0F, colors.muted);
   DrawUiText(ui_font, FormatFixed(coordinate_pulse_interval, coordinate_pulse_interval < 1.0 ? 2 : 1) + " y",
-             frame_box.x + 286.0F, frame_box.y + 262.0F, 18.0F, earth_frame);
+             frame_box.x + 286.0F, frame_box.y + 262.0F, 18.0F, colors.earth_frame);
 
   DrawUiText(ui_font,
              cosmology_note ? "Special relativity only. Cosmological expansion is not included at this distance."
                             : "Special relativity only. Earth and destination are stationary in one inertial frame.",
-             card.x + 30.0F, card.y + 500.0F, 18.0F, cosmology_note ? warning : muted);
+             card.x + 30.0F, card.y + 500.0F, 18.0F, cosmology_note ? colors.warning : colors.muted);
 }
 
 bool ExportMissionArtifacts(std::string_view export_prefix, const Font& ui_font, RenderTexture2D scene_target,
                             const relativity::MissionResult& mission, const std::string& mission_name,
                             const std::string& destination_name, double coordinate_pulse_interval,
-                            double proper_pulse_interval, bool cosmology_note, Color app_background,
-                            Color viewport_background, Color panel_edge, Color text, Color muted, Color earth_frame,
-                            Color traveler_frame, Color warning) {
+                            double proper_pulse_interval, bool cosmology_note, const AppColors& colors) {
   if (export_prefix.empty()) {
     return false;
   }
@@ -737,28 +902,617 @@ bool ExportMissionArtifacts(std::string_view export_prefix, const Font& ui_font,
   SetTextureFilter(summary_target.texture, TEXTURE_FILTER_BILINEAR);
 
   BeginTextureMode(summary_target);
-  ClearBackground(app_background);
+  ClearBackground(colors.app_background);
   DrawMissionSummaryCard(ui_font, mission, mission_name, destination_name, coordinate_pulse_interval, proper_pulse_interval,
-                         cosmology_note, app_background, viewport_background, panel_edge, text, muted, earth_frame,
-                         traveler_frame, warning);
+                         cosmology_note, colors);
   EndTextureMode();
 
   const bool visual_saved = ExportRenderTexturePng(scene_target, visual_path);
   const bool summary_saved = ExportRenderTexturePng(summary_target, summary_path);
   UnloadRenderTexture(summary_target);
 
-  TraceLog(summary_saved && visual_saved ? LOG_INFO : LOG_WARNING,
-           "mission export summary=%s visual=%s", summary_saved ? summary_path.c_str() : "failed",
-           visual_saved ? visual_path.c_str() : "failed");
+  TraceLog(summary_saved && visual_saved ? LOG_INFO : LOG_WARNING, "mission export summary=%s visual=%s",
+           summary_saved ? summary_path.c_str() : "failed", visual_saved ? visual_path.c_str() : "failed");
 
   return summary_saved && visual_saved;
 }
 
+class RelativisticCamera {
+ public:
+  RelativisticCamera() {
+    ResetView();
+  }
+
+  void ToggleMode() {
+    mode_ = mode_ == ViewMode::ThirdPerson ? ViewMode::Cockpit : ViewMode::ThirdPerson;
+  }
+
+  void ResetView() {
+    third_person_target_ = {0.0F, 0.15F, 0.0F};
+    third_person_distance_ = 24.0F;
+    third_person_yaw_ = -0.42F;
+    third_person_pitch_ = 0.24F;
+    third_person_camera_.target = third_person_target_;
+    third_person_camera_.up = {0.0F, 1.0F, 0.0F};
+    third_person_camera_.fovy = 38.0F;
+    third_person_camera_.projection = CAMERA_PERSPECTIVE;
+    cockpit_look_yaw_ = 0.0F;
+    cockpit_look_pitch_ = 0.0F;
+    cockpit_camera_.up = {0.0F, 1.0F, 0.0F};
+    cockpit_camera_.fovy = 72.0F;
+    cockpit_camera_.projection = CAMERA_PERSPECTIVE;
+    CommitThirdPersonCamera();
+  }
+
+  void HandleViewportInput(bool mouse_in_viewport, Vector2 mouse_delta, float wheel, float dt) {
+    if (mode_ == ViewMode::ThirdPerson) {
+      HandleThirdPersonInput(mouse_in_viewport, mouse_delta, wheel, dt);
+      return;
+    }
+
+    HandleCockpitInput(mouse_in_viewport, mouse_delta, dt);
+  }
+
+  void UpdateFromShip(const PathFrame& ship_frame) {
+    const Vector3 cockpit_eye =
+        Add(ship_frame.center, Add(Scale(ship_frame.up, 0.22F), Scale(ship_frame.tangent, 0.08F)));
+    const Vector3 yaw_adjusted_forward = RotateAroundAxis(ship_frame.tangent, ship_frame.up, cockpit_look_yaw_);
+    const Vector3 pitch_axis = Normalize(Cross(ship_frame.up, yaw_adjusted_forward));
+    const Vector3 cockpit_forward = Normalize(RotateAroundAxis(yaw_adjusted_forward, pitch_axis, cockpit_look_pitch_));
+    const Vector3 cockpit_up = Normalize(Cross(cockpit_forward, pitch_axis));
+    cockpit_camera_.position = cockpit_eye;
+    cockpit_camera_.target = Add(cockpit_eye, Scale(cockpit_forward, 12.0F));
+    cockpit_camera_.up = cockpit_up;
+    CommitThirdPersonCamera();
+  }
+
+  const Camera3D& ActiveCamera() const {
+    return mode_ == ViewMode::Cockpit ? cockpit_camera_ : third_person_camera_;
+  }
+
+  bool IsCockpitMode() const {
+    return mode_ == ViewMode::Cockpit;
+  }
+
+  std::string_view ModeLabel() const {
+    return mode_ == ViewMode::Cockpit ? "Cockpit Mode" : "Third-Person View";
+  }
+
+ private:
+  void HandleThirdPersonInput(bool mouse_in_viewport, Vector2 mouse_delta, float wheel, float dt) {
+    if (wheel != 0.0F) {
+      third_person_distance_ = std::clamp(third_person_distance_ - (wheel * 1.15F), 7.5F, 34.0F);
+    }
+
+    if (mouse_in_viewport && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+      third_person_yaw_ -= mouse_delta.x * 0.0065F;
+      third_person_pitch_ = std::clamp(third_person_pitch_ - (mouse_delta.y * 0.0045F), -0.25F, 1.10F);
+    }
+
+    if (mouse_in_viewport && IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
+      const Vector3 forward = Normalize(Subtract(third_person_camera_.target, third_person_camera_.position));
+      const Vector3 right = Normalize(Cross(third_person_camera_.up, forward));
+      const Vector3 pan_offset =
+          Add(Scale(right, -mouse_delta.x * 0.018F), Scale(third_person_camera_.up, mouse_delta.y * 0.018F));
+      third_person_target_ = Add(third_person_target_, pan_offset);
+    }
+
+    const float keyboard_pan_speed = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT) ? 8.0F : 4.5F;
+    const Vector3 forward = Normalize(Subtract(third_person_camera_.target, third_person_camera_.position));
+    const Vector3 planar_forward = Normalize({forward.x, 0.0F, forward.z});
+    const Vector3 right = Normalize(Cross(third_person_camera_.up, forward));
+    const float move_scale = keyboard_pan_speed * dt;
+
+    if (IsKeyDown(KEY_W)) {
+      third_person_target_ = Add(third_person_target_, Scale(planar_forward, move_scale));
+    }
+    if (IsKeyDown(KEY_S)) {
+      third_person_target_ = Add(third_person_target_, Scale(planar_forward, -move_scale));
+    }
+    if (IsKeyDown(KEY_A)) {
+      third_person_target_ = Add(third_person_target_, Scale(right, move_scale));
+    }
+    if (IsKeyDown(KEY_D)) {
+      third_person_target_ = Add(third_person_target_, Scale(right, -move_scale));
+    }
+    if (IsKeyDown(KEY_Q)) {
+      third_person_target_ = Add(third_person_target_, Scale(third_person_camera_.up, move_scale));
+    }
+    if (IsKeyDown(KEY_Z)) {
+      third_person_target_ = Add(third_person_target_, Scale(third_person_camera_.up, -move_scale));
+    }
+
+    CommitThirdPersonCamera();
+  }
+
+  void HandleCockpitInput(bool mouse_in_viewport, Vector2 mouse_delta, float dt) {
+    if (mouse_in_viewport && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+      cockpit_look_yaw_ -= mouse_delta.x * 0.0048F;
+      cockpit_look_pitch_ = std::clamp(cockpit_look_pitch_ - (mouse_delta.y * 0.0038F), -1.20F, 1.20F);
+    }
+
+    const float keyboard_look_speed = 1.45F * dt;
+    if (IsKeyDown(KEY_J)) {
+      cockpit_look_yaw_ += keyboard_look_speed;
+    }
+    if (IsKeyDown(KEY_L)) {
+      cockpit_look_yaw_ -= keyboard_look_speed;
+    }
+    if (IsKeyDown(KEY_I)) {
+      cockpit_look_pitch_ = std::clamp(cockpit_look_pitch_ + keyboard_look_speed, -1.20F, 1.20F);
+    }
+    if (IsKeyDown(KEY_K)) {
+      cockpit_look_pitch_ = std::clamp(cockpit_look_pitch_ - keyboard_look_speed, -1.20F, 1.20F);
+    }
+  }
+
+  void CommitThirdPersonCamera() {
+    third_person_camera_.position =
+        CameraPositionFromOrbit(third_person_target_, third_person_distance_, third_person_yaw_, third_person_pitch_);
+    third_person_camera_.target = third_person_target_;
+  }
+
+  ViewMode mode_ {ViewMode::ThirdPerson};
+  Camera3D third_person_camera_ {};
+  Camera3D cockpit_camera_ {};
+  Vector3 third_person_target_ {};
+  float third_person_distance_ {};
+  float third_person_yaw_ {};
+  float third_person_pitch_ {};
+  float cockpit_look_yaw_ {};
+  float cockpit_look_pitch_ {};
+};
+
+class MissionScene {
+ public:
+  MissionScene(const relativity::MissionResult& mission, const Rectangle& viewport, const AppColors& colors)
+      : mission_(mission),
+        viewport_(viewport),
+        colors_(colors),
+        scene_target_(LoadRenderTexture(static_cast<int>(viewport.width), static_cast<int>(viewport.height))),
+        lighting_shader_(LoadShaderFromMemory(kLightingVertexShader, kLightingFragmentShader)),
+        cockpit_shader_(LoadShaderFromMemory(kCockpitVertexShader, kCockpitFragmentShader)),
+        earth_world_ {-10.5F, 2.2F, -4.8F},
+        turnaround_world_ {0.0F, 0.8F, 0.0F},
+        destination_world_ {10.5F, -1.9F, 4.8F},
+        turnaround_curve_world_ {QuadraticBezierPoint(earth_world_, turnaround_world_, destination_world_, 0.5F)} {
+    SetTextureFilter(scene_target_.texture, TEXTURE_FILTER_BILINEAR);
+
+    ambient_location_ = GetShaderLocation(lighting_shader_, "ambient");
+    view_position_location_ = GetShaderLocation(lighting_shader_, "viewPos");
+    const float ambient_value[4] {0.22F, 0.24F, 0.28F, 1.0F};
+    SetShaderValue(lighting_shader_, ambient_location_, ambient_value, SHADER_UNIFORM_VEC4);
+
+    cockpit_resolution_location_ = GetShaderLocation(cockpit_shader_, "resolution");
+    cockpit_beta_location_ = GetShaderLocation(cockpit_shader_, "beta");
+    cockpit_gamma_location_ = GetShaderLocation(cockpit_shader_, "gamma");
+    cockpit_forward_location_ = GetShaderLocation(cockpit_shader_, "cameraForward");
+    cockpit_right_location_ = GetShaderLocation(cockpit_shader_, "cameraRight");
+    cockpit_up_location_ = GetShaderLocation(cockpit_shader_, "cameraUp");
+    cockpit_fovy_location_ = GetShaderLocation(cockpit_shader_, "fovyRadians");
+    cockpit_aspect_location_ = GetShaderLocation(cockpit_shader_, "aspectRatio");
+
+    lights_.push_back(CreateShaderLight(0, 0, {-8.5F, 11.0F, 10.0F}, {0.0F, 0.0F, 0.0F},
+                                        Color {240, 244, 255, 255}, lighting_shader_));
+    lights_.push_back(CreateShaderLight(1, 1, {8.5F, 4.5F, 5.5F}, {0.0F, 0.0F, 0.0F},
+                                        Color {196, 212, 255, 255}, lighting_shader_));
+    lights_.push_back(CreateShaderLight(2, 1, {-2.5F, 2.0F, -8.0F}, {0.0F, 0.0F, 0.0F},
+                                        Color {198, 186, 170, 255}, lighting_shader_));
+  }
+
+  ~MissionScene() {
+    if (proper_time_rate_tube_ready_) {
+      UnloadModel(proper_time_rate_tube_model_);
+    }
+    UnloadShader(cockpit_shader_);
+    UnloadShader(lighting_shader_);
+    UnloadRenderTexture(scene_target_);
+  }
+
+  PathFrame ShipFrame(const relativity::WorldlineSample& current) const {
+    const float travel_fraction = static_cast<float>(current.position_ly / mission_.profile.distance_ly);
+    return EvaluatePathFrame(earth_world_, turnaround_world_, destination_world_, travel_fraction,
+                             ProperTimeRateTubeRadius(current.proper_time_rate));
+  }
+
+  SceneLabels ProjectLabels(const Camera3D& camera) const {
+    return {
+        .earth = GetWorldToScreenEx(earth_world_, camera, static_cast<int>(viewport_.width),
+                                    static_cast<int>(viewport_.height)),
+        .destination = GetWorldToScreenEx(destination_world_, camera, static_cast<int>(viewport_.width),
+                                          static_cast<int>(viewport_.height)),
+        .turnaround = GetWorldToScreenEx(turnaround_curve_world_, camera, static_cast<int>(viewport_.width),
+                                         static_cast<int>(viewport_.height)),
+    };
+  }
+
+  void Render(const RelativisticCamera& camera, const relativity::WorldlineSample& current, std::size_t current_index,
+              double coordinate_pulse_interval, double proper_pulse_interval) {
+    BeginTextureMode(scene_target_);
+    ClearBackground(colors_.viewport_background);
+
+    if (camera.IsCockpitMode()) {
+      RenderCockpit(camera.ActiveCamera(), current);
+    } else {
+      RenderThirdPerson(camera.ActiveCamera(), current, current_index, coordinate_pulse_interval, proper_pulse_interval);
+    }
+
+    EndTextureMode();
+  }
+
+  const RenderTexture2D& RenderTarget() const {
+    return scene_target_;
+  }
+
+  const Vector3& EarthWorld() const {
+    return earth_world_;
+  }
+
+  const Vector3& DestinationWorld() const {
+    return destination_world_;
+  }
+
+  const Vector3& TurnaroundCurveWorld() const {
+    return turnaround_curve_world_;
+  }
+
+ private:
+  void UpdateTubeModel(std::size_t current_index) {
+    if (current_index <= 1) {
+      return;
+    }
+    if (current_index == proper_time_rate_tube_index_) {
+      return;
+    }
+
+    if (proper_time_rate_tube_ready_) {
+      UnloadModel(proper_time_rate_tube_model_);
+      proper_time_rate_tube_ready_ = false;
+    }
+
+    proper_time_rate_tube_model_ =
+        BuildProperTimeRateTubeModel(mission_, current_index, earth_world_, turnaround_world_, destination_world_, 48);
+    proper_time_rate_tube_model_.materials[0].shader = lighting_shader_;
+    proper_time_rate_tube_ready_ = true;
+    proper_time_rate_tube_index_ = current_index;
+  }
+
+  void RenderThirdPerson(const Camera3D& camera, const relativity::WorldlineSample& current, std::size_t current_index,
+                         double coordinate_pulse_interval, double proper_pulse_interval) {
+    UpdateTubeModel(current_index);
+
+    const float view_position[3] {camera.position.x, camera.position.y, camera.position.z};
+    SetShaderValue(lighting_shader_, view_position_location_, view_position, SHADER_UNIFORM_VEC3);
+    for (const auto& light : lights_) {
+      UpdateShaderLight(lighting_shader_, light);
+    }
+
+    const float travel_fraction = static_cast<float>(current.position_ly / mission_.profile.distance_ly);
+    const PathFrame ship_frame = ShipFrame(current);
+    const std::vector<PulseMarker> coordinate_pulses =
+        BuildPulseMarkers(mission_, current_index, coordinate_pulse_interval, TimeDomain::Coordinate);
+    const std::vector<PulseMarker> proper_pulses =
+        BuildPulseMarkers(mission_, current_index, proper_pulse_interval, TimeDomain::Proper);
+
+    BeginMode3D(camera);
+
+    DrawGrid(24, 1.5F);
+    DrawTrajectoryCurve(earth_world_, turnaround_world_, destination_world_, 1.0F, 90, Fade(colors_.grid, 0.28F));
+    DrawTrajectoryCurve(earth_world_, turnaround_world_, destination_world_, travel_fraction, 90,
+                        Fade(colors_.structure, 0.32F));
+    DrawSphereEx(earth_world_, 0.46F, 18, 18, colors_.earth_body);
+    DrawSphereEx(destination_world_, 0.38F, 18, 18, colors_.destination_body);
+    DrawSphereWires(earth_world_, 0.46F, 12, 12, Fade(colors_.structure, 0.65F));
+    DrawSphereWires(destination_world_, 0.38F, 12, 12, Fade(colors_.structure, 0.52F));
+
+    if (proper_time_rate_tube_ready_) {
+      DrawModel(proper_time_rate_tube_model_, {0.0F, 0.0F, 0.0F}, 1.0F, Fade(colors_.traveler_frame, 0.26F));
+      DrawModelWires(proper_time_rate_tube_model_, {0.0F, 0.0F, 0.0F}, 1.0F, Fade(colors_.traveler_frame, 0.54F));
+    }
+
+    for (const auto& marker : coordinate_pulses) {
+      const PathFrame frame = EvaluatePathFrame(earth_world_, turnaround_world_, destination_world_, marker.path_fraction,
+                                                marker.proper_time_rate_radius);
+      const float radius = std::max(frame.proper_time_rate_radius + 0.30F, frame.proper_time_rate_radius * 1.18F);
+      DrawRingSegments(frame, radius, 0.016F, Fade(colors_.earth_frame, 0.36F), 28);
+    }
+
+    for (const auto& marker : proper_pulses) {
+      const PathFrame frame = EvaluatePathFrame(earth_world_, turnaround_world_, destination_world_, marker.path_fraction,
+                                                marker.proper_time_rate_radius);
+      DrawRingSegments(frame, frame.proper_time_rate_radius + 0.03F, 0.030F, Fade(colors_.traveler_frame, 0.70F), 28);
+    }
+
+    const Vector3 ship_world = ship_frame.center;
+    const bool decelerating_phase = current.signed_proper_acceleration_ly_per_year2 < 0.0;
+    const Vector3 acceleration_offset_start = Add(ship_world, {0.0F, 0.78F, 0.0F});
+    const float acceleration_vector_length = 0.86F + (1.55F * static_cast<float>(current.beta));
+    const float acceleration_direction_sign = decelerating_phase ? -1.0F : 1.0F;
+    const Vector3 acceleration_vector_end =
+        Add(acceleration_offset_start, Scale(ship_frame.tangent, acceleration_vector_length * acceleration_direction_sign));
+    const Vector3 probe_tail = Add(ship_world, Scale(ship_frame.tangent, -0.65F));
+    const Vector3 probe_nose = Add(ship_world, Scale(ship_frame.tangent, 0.65F));
+
+    DrawCylinderEx(probe_tail, probe_nose, 0.16F, 0.08F, 12, Fade(colors_.text, 0.96F));
+    DrawSphereEx(ship_world, 0.15F, 10, 10, Fade(colors_.app_background, 0.92F));
+    DrawCylinderEx(acceleration_offset_start, acceleration_vector_end, 0.03F, 0.03F, 10, colors_.traveler_frame);
+    DrawCylinderEx(Add(acceleration_vector_end, Scale(ship_frame.tangent, -0.18F)), acceleration_vector_end, 0.10F, 0.0F,
+                   10, colors_.traveler_frame);
+
+    EndMode3D();
+  }
+
+  void RenderCockpit(const Camera3D& camera, const relativity::WorldlineSample& current) {
+    const Vector2 resolution {viewport_.width, viewport_.height};
+    const float beta = static_cast<float>(current.beta);
+    const float gamma = static_cast<float>(current.gamma);
+    const Vector3 forward = Normalize(Subtract(camera.target, camera.position));
+    const Vector3 right = Normalize(Cross(camera.up, forward));
+    const Vector3 up = Normalize(Cross(forward, right));
+    const float fovy_radians = camera.fovy * DEG2RAD;
+    const float aspect_ratio = viewport_.width / viewport_.height;
+    const float forward_data[3] {forward.x, forward.y, forward.z};
+    const float right_data[3] {right.x, right.y, right.z};
+    const float up_data[3] {up.x, up.y, up.z};
+
+    SetShaderValue(cockpit_shader_, cockpit_resolution_location_, &resolution, SHADER_UNIFORM_VEC2);
+    SetShaderValue(cockpit_shader_, cockpit_beta_location_, &beta, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(cockpit_shader_, cockpit_gamma_location_, &gamma, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(cockpit_shader_, cockpit_forward_location_, forward_data, SHADER_UNIFORM_VEC3);
+    SetShaderValue(cockpit_shader_, cockpit_right_location_, right_data, SHADER_UNIFORM_VEC3);
+    SetShaderValue(cockpit_shader_, cockpit_up_location_, up_data, SHADER_UNIFORM_VEC3);
+    SetShaderValue(cockpit_shader_, cockpit_fovy_location_, &fovy_radians, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(cockpit_shader_, cockpit_aspect_location_, &aspect_ratio, SHADER_UNIFORM_FLOAT);
+
+    BeginShaderMode(cockpit_shader_);
+    DrawRectangleRec({0.0F, 0.0F, viewport_.width, viewport_.height}, WHITE);
+    EndShaderMode();
+
+    const Vector2 center {viewport_.width * 0.5F, viewport_.height * 0.5F};
+    DrawCircleLinesV(center, 18.0F, Fade(colors_.traveler_frame, 0.65F));
+    DrawLineEx({center.x - 30.0F, center.y}, {center.x - 8.0F, center.y}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
+    DrawLineEx({center.x + 8.0F, center.y}, {center.x + 30.0F, center.y}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
+    DrawLineEx({center.x, center.y - 30.0F}, {center.x, center.y - 8.0F}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
+    DrawLineEx({center.x, center.y + 8.0F}, {center.x, center.y + 30.0F}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
+  }
+
+  const relativity::MissionResult& mission_;
+  Rectangle viewport_ {};
+  AppColors colors_ {};
+  RenderTexture2D scene_target_ {};
+  Shader lighting_shader_ {};
+  Shader cockpit_shader_ {};
+  int ambient_location_ {-1};
+  int view_position_location_ {-1};
+  int cockpit_resolution_location_ {-1};
+  int cockpit_beta_location_ {-1};
+  int cockpit_gamma_location_ {-1};
+  int cockpit_forward_location_ {-1};
+  int cockpit_right_location_ {-1};
+  int cockpit_up_location_ {-1};
+  int cockpit_fovy_location_ {-1};
+  int cockpit_aspect_location_ {-1};
+  std::vector<ShaderLight> lights_ {};
+  Model proper_time_rate_tube_model_ {};
+  bool proper_time_rate_tube_ready_ {false};
+  std::size_t proper_time_rate_tube_index_ {std::numeric_limits<std::size_t>::max()};
+  Vector3 earth_world_ {};
+  Vector3 turnaround_world_ {};
+  Vector3 destination_world_ {};
+  Vector3 turnaround_curve_world_ {};
+};
+
+class DashboardUI {
+ public:
+  DashboardUI(const Font& ui_font, const relativity::MissionResult& mission, const std::string& mission_name,
+              const std::string& destination_name, double coordinate_pulse_interval, double proper_pulse_interval,
+              bool cosmology_note, const AppColors& colors)
+      : ui_font_(ui_font),
+        mission_(mission),
+        mission_name_(mission_name),
+        destination_name_(destination_name),
+        coordinate_pulse_interval_(coordinate_pulse_interval),
+        proper_pulse_interval_(proper_pulse_interval),
+        cosmology_note_(cosmology_note),
+        colors_(colors) {}
+
+  const UiLayout& Layout() const {
+    return layout_;
+  }
+
+  void Draw(const RenderTexture2D& scene_target, const relativity::WorldlineSample& current, float stage, bool playing,
+            const Vector2 mouse, std::string_view view_mode_label, bool cockpit_mode, const SceneLabels& labels,
+            bool show_turnaround_label) const {
+    DrawUiText(ui_font_, "Relativity Mission Control", 40.0F, 26.0F, 24.0F, colors_.text);
+    DrawUiText(ui_font_,
+               mission_name_ + "    " + FormatFixed(mission_.profile.distance_ly, 2) + " ly"
+                   + "    beta_max " + FormatFixed(mission_.summary.peak_beta, 2)
+                   + "    " + std::string(view_mode_label),
+               42.0F, 56.0F, 15.0F, colors_.muted);
+
+    DrawPanel(layout_.viewport, colors_.viewport_background, colors_.panel_edge);
+    DrawTexturePro(scene_target.texture,
+                   {0.0F, 0.0F, static_cast<float>(scene_target.texture.width),
+                    -static_cast<float>(scene_target.texture.height)},
+                   layout_.viewport, {0.0F, 0.0F}, 0.0F, WHITE);
+    DrawRectangleRoundedLinesEx(layout_.viewport, 0.015F, 10, 1.0F, colors_.panel_edge);
+
+    if (!cockpit_mode) {
+      DrawUiText(ui_font_, "Earth", layout_.viewport.x + labels.earth.x - 18.0F, layout_.viewport.y + labels.earth.y - 42.0F,
+                 18.0F, colors_.structure);
+      DrawUiText(ui_font_, destination_name_, layout_.viewport.x + labels.destination.x - 56.0F,
+                 layout_.viewport.y + labels.destination.y + 18.0F, 16.0F, colors_.structure);
+
+      if (show_turnaround_label) {
+        DrawUiText(ui_font_, "Turnaround Event", layout_.viewport.x + labels.turnaround.x + 24.0F,
+                   layout_.viewport.y + labels.turnaround.y - 10.0F, 15.0F, colors_.text);
+      }
+    }
+
+    DrawMissionStatePanel(current, view_mode_label);
+    DrawFrameTimesPanel(current);
+    DrawSimultaneityPanel(current, cockpit_mode);
+    DrawControls(stage, playing, mouse, cockpit_mode);
+  }
+
+ private:
+  void DrawMissionStatePanel(const relativity::WorldlineSample& current, std::string_view view_mode_label) const {
+    DrawPanel(layout_.mission_panel, Color {19, 23, 29, 184}, Fade(colors_.panel_edge, 0.60F));
+    DrawUiText(ui_font_, "Mission State", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 14.0F, 16.0F,
+               colors_.muted);
+    DrawUiText(ui_font_, "view", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 40.0F, 14.0F, colors_.muted);
+    DrawUiText(ui_font_, std::string(view_mode_label), layout_.mission_panel.x + 92.0F, layout_.mission_panel.y + 40.0F,
+               14.0F, colors_.text);
+    DrawUiText(ui_font_, "phase", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 66.0F, 14.0F, colors_.muted);
+    DrawUiText(ui_font_, std::string(PhaseLabel(current.progress)), layout_.mission_panel.x + 92.0F,
+               layout_.mission_panel.y + 66.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, "beta", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 92.0F, 14.0F, colors_.muted);
+    DrawUiText(ui_font_, FormatFixed(current.beta, 3), layout_.mission_panel.x + 92.0F, layout_.mission_panel.y + 92.0F,
+               14.0F, colors_.text);
+    DrawUiText(ui_font_, "Lorentz factor", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 118.0F, 14.0F,
+               colors_.muted);
+    DrawUiText(ui_font_, FormatFixed(current.gamma, 4), layout_.mission_panel.x + 138.0F, layout_.mission_panel.y + 118.0F,
+               14.0F, colors_.text);
+    DrawUiText(ui_font_, "proper-time rate", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 144.0F, 14.0F,
+               colors_.muted);
+    DrawUiText(ui_font_, FormatFixed(current.proper_time_rate, 4), layout_.mission_panel.x + 138.0F,
+               layout_.mission_panel.y + 144.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, DynamicsLabel(current.signed_proper_acceleration_ly_per_year2), layout_.mission_panel.x + 16.0F,
+               layout_.mission_panel.y + 170.0F, 13.0F, colors_.muted);
+    DrawUiText(ui_font_, FormatFixed(std::abs(current.signed_proper_acceleration_ly_per_year2), 3) + " ly / y^2",
+               layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 188.0F, 13.0F, colors_.text);
+  }
+
+  void DrawFrameTimesPanel(const relativity::WorldlineSample& current) const {
+    DrawPanel(layout_.frames_panel, Color {19, 23, 29, 184}, Fade(colors_.panel_edge, 0.60F));
+
+    const Rectangle earth_rail {layout_.frames_panel.x + 24.0F, layout_.frames_panel.y + 62.0F, 28.0F, 116.0F};
+    const Rectangle traveler_rail {layout_.frames_panel.x + 138.0F, layout_.frames_panel.y + 62.0F, 28.0F, 116.0F};
+    const float earth_progress = static_cast<float>(current.coordinate_time_years / mission_.summary.coordinate_time_years);
+    const float traveler_progress = static_cast<float>(current.proper_time_years / mission_.summary.coordinate_time_years);
+    const float earth_marker_y = earth_rail.y + earth_rail.height - (earth_rail.height * earth_progress);
+    const float traveler_marker_y = traveler_rail.y + traveler_rail.height - (traveler_rail.height * traveler_progress);
+
+    DrawUiText(ui_font_, "Frame Times", layout_.frames_panel.x + 16.0F, layout_.frames_panel.y + 14.0F, 16.0F,
+               colors_.muted);
+    DrawUiText(ui_font_, "Earth", earth_rail.x - 2.0F, earth_rail.y - 24.0F, 13.0F, colors_.earth_frame);
+    DrawUiText(ui_font_, "Traveler", traveler_rail.x - 8.0F, traveler_rail.y - 24.0F, 13.0F, colors_.traveler_frame);
+
+    DrawRectangleRounded(earth_rail, 0.2F, 8, Fade(colors_.earth_frame, 0.07F));
+    DrawRectangleRoundedLinesEx(earth_rail, 0.2F, 8, 1.0F, Fade(colors_.earth_frame, 0.42F));
+    DrawRectangleRounded(
+        {earth_rail.x, earth_rail.y + earth_rail.height - (earth_rail.height * earth_progress), earth_rail.width,
+         earth_rail.height * earth_progress},
+        0.2F, 8, Fade(colors_.earth_frame, 0.30F));
+
+    DrawRectangleRounded(traveler_rail, 0.2F, 8, Fade(colors_.traveler_frame, 0.07F));
+    DrawRectangleRoundedLinesEx(traveler_rail, 0.2F, 8, 1.0F, Fade(colors_.traveler_frame, 0.48F));
+    DrawRectangleRounded(
+        {traveler_rail.x, traveler_rail.y + traveler_rail.height - (traveler_rail.height * traveler_progress),
+         traveler_rail.width, traveler_rail.height * traveler_progress},
+        0.2F, 8, Fade(colors_.traveler_frame, 0.32F));
+
+    DrawLineEx({earth_rail.x - 10.0F, earth_marker_y}, {earth_rail.x + earth_rail.width + 10.0F, earth_marker_y}, 2.0F,
+               colors_.earth_frame);
+    DrawLineEx({traveler_rail.x - 10.0F, traveler_marker_y},
+               {traveler_rail.x + traveler_rail.width + 10.0F, traveler_marker_y}, 2.0F, colors_.traveler_frame);
+
+    DrawUiText(ui_font_, FormatFixed(current.coordinate_time_years, 2) + " y", earth_rail.x - 12.0F,
+               earth_rail.y + earth_rail.height + 10.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, FormatFixed(current.proper_time_years, 2) + " y", traveler_rail.x - 10.0F,
+               traveler_rail.y + traveler_rail.height + 10.0F, 14.0F, colors_.text);
+
+    DrawUiText(ui_font_, "delta", layout_.frames_panel.x + 16.0F, layout_.frames_panel.y + 200.0F, 13.0F,
+               colors_.muted);
+    DrawUiText(ui_font_, FormatFixed(current.coordinate_time_years - current.proper_time_years, 3) + " y",
+               layout_.frames_panel.x + 92.0F, layout_.frames_panel.y + 200.0F, 13.0F, colors_.traveler_frame);
+  }
+
+  void DrawSimultaneityPanel(const relativity::WorldlineSample& current, bool cockpit_mode) const {
+    DrawPanel(layout_.simultaneity_panel, Color {19, 23, 29, 184}, Fade(colors_.panel_edge, 0.60F));
+    DrawUiText(ui_font_, "Simultaneity Dashboard", layout_.simultaneity_panel.x + 16.0F,
+               layout_.simultaneity_panel.y + 14.0F, 16.0F, colors_.muted);
+
+    const float label_x = layout_.simultaneity_panel.x + 16.0F;
+    const float value_x = layout_.simultaneity_panel.x + 168.0F;
+    DrawUiText(ui_font_, "Proper Time", label_x, layout_.simultaneity_panel.y + 46.0F, 14.0F, colors_.traveler_frame);
+    DrawUiText(ui_font_, FormatFixed(current.proper_time_years, 3) + " y", value_x,
+               layout_.simultaneity_panel.y + 46.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, "Coordinate Time", label_x, layout_.simultaneity_panel.y + 74.0F, 14.0F, colors_.earth_frame);
+    DrawUiText(ui_font_, FormatFixed(current.coordinate_time_years, 3) + " y", value_x,
+               layout_.simultaneity_panel.y + 74.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, "Delayed Observation", label_x, layout_.simultaneity_panel.y + 102.0F, 14.0F,
+               colors_.traveler_frame);
+    DrawUiText(ui_font_, FormatFixed(DelayedObservationTimeYears(current), 3) + " y", value_x,
+               layout_.simultaneity_panel.y + 102.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, "Earth light-travel delay", label_x, layout_.simultaneity_panel.y + 130.0F, 13.0F,
+               colors_.muted);
+    DrawUiText(ui_font_, FormatFixed(current.position_ly, 3) + " y", value_x, layout_.simultaneity_panel.y + 130.0F,
+               13.0F, colors_.earth_frame);
+    DrawUiText(ui_font_,
+               cockpit_mode ? "Observed sky includes aberration, Doppler shift, and relativistic beaming."
+                            : "Earth-frame now and delayed observation are kept distinct.",
+               label_x, layout_.simultaneity_panel.y + 160.0F, 12.0F, colors_.muted);
+  }
+
+  void DrawControls(float stage, bool playing, const Vector2 mouse, bool cockpit_mode) const {
+    DrawRectangleRounded(layout_.controls, 0.04F, 10, colors_.viewport_background);
+    DrawRectangleRoundedLinesEx(layout_.controls, 0.04F, 10, 1.0F, colors_.panel_edge);
+
+    DrawButton(ui_font_, layout_.play_button, playing ? "Pause" : "Play", playing,
+               CheckCollisionPointRec(mouse, layout_.play_button), colors_.traveler_frame, colors_.traveler_frame,
+               colors_.app_background);
+    DrawButton(ui_font_, layout_.reset_button, "Reset", false, CheckCollisionPointRec(mouse, layout_.reset_button),
+               Color {88, 96, 108, 255}, colors_.panel_edge, colors_.text);
+
+    DrawRectangleRounded(layout_.slider_track, 1.0F, 16, Color {44, 49, 57, 255});
+    DrawRectangleRounded({layout_.slider_track.x, layout_.slider_track.y, layout_.slider_track.width * stage,
+                          layout_.slider_track.height},
+                         1.0F, 16, colors_.traveler_frame);
+    const Vector2 knob_center {layout_.slider_track.x + (layout_.slider_track.width * stage),
+                               layout_.slider_track.y + (layout_.slider_track.height * 0.5F)};
+    DrawCircleV(knob_center, 8.0F, colors_.text);
+    DrawCircleV(knob_center, 3.0F, colors_.app_background);
+
+    DrawUiText(ui_font_, "Playback", 304.0F, 730.0F, 17.0F, colors_.muted);
+    DrawUiText(ui_font_, "Space play/pause    Left/Right scrub    wheel zooms    C resets camera", 962.0F,
+               730.0F, 14.0F, colors_.muted);
+    DrawUiText(ui_font_,
+               cockpit_mode ? "Right-drag or I/J/K/L look around    F third-person view    E export PNGs"
+                            : "Right-drag orbit    Middle-drag pan    WASD/QZ move view    F cockpit mode",
+               786.0F, 748.0F, 14.0F, colors_.muted);
+    DrawUiText(ui_font_, cockpit_mode ? "Cockpit mode active." : "Third-person world-tube active.", 470.0F, 748.0F,
+               14.0F, colors_.traveler_frame);
+    DrawUiText(ui_font_,
+               cosmology_note_ ? "SR model only; cosmology not included." : "SR model only.",
+               650.0F, 748.0F, 14.0F, cosmology_note_ ? colors_.warning : colors_.muted);
+  }
+
+  const Font& ui_font_;
+  const relativity::MissionResult& mission_;
+  std::string mission_name_;
+  std::string destination_name_;
+  double coordinate_pulse_interval_ {};
+  double proper_pulse_interval_ {};
+  bool cosmology_note_ {};
+  AppColors colors_ {};
+  UiLayout layout_ {
+      .viewport = {40.0F, 96.0F, 1200.0F, 600.0F},
+      .controls = {40.0F, 720.0F, 1200.0F, 64.0F},
+      .play_button = {60.0F, 736.0F, 92.0F, 32.0F},
+      .reset_button = {164.0F, 736.0F, 92.0F, 32.0F},
+      .slider_track = {304.0F, 751.0F, 560.0F, 8.0F},
+      .mission_panel = {76.0F, 138.0F, 236.0F, 218.0F},
+      .frames_panel = {1012.0F, 138.0F, 200.0F, 236.0F},
+      .simultaneity_panel = {954.0F, 392.0F, 258.0F, 186.0F},
+  };
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  const int screen_width = 1280;
-  const int screen_height = 820;
+  constexpr int kScreenWidth = 1280;
+  constexpr int kScreenHeight = 820;
 
   CliOptions options;
   try {
@@ -791,65 +1545,30 @@ int main(int argc, char** argv) {
   const bool cosmology_note = NeedsCosmologyNote(mission.profile.distance_ly);
   const bool auto_export = !options.export_prefix.empty();
 
-  InitWindow(screen_width, screen_height, "Relativity Mission Control");
+  InitWindow(kScreenWidth, kScreenHeight, "Relativity Mission Control");
   SetTargetFPS(60);
 
-  const Rectangle viewport {40.0F, 96.0F, 1200.0F, 600.0F};
-  const Rectangle controls {40.0F, 720.0F, 1200.0F, 64.0F};
-  const Rectangle play_button {60.0F, 736.0F, 92.0F, 32.0F};
-  const Rectangle reset_button {164.0F, 736.0F, 92.0F, 32.0F};
-  const Rectangle slider_track {304.0F, 751.0F, 700.0F, 8.0F};
-  const Rectangle mission_panel {76.0F, 138.0F, 236.0F, 186.0F};
-  const Rectangle frames_panel {1022.0F, 138.0F, 190.0F, 236.0F};
-
-  const Color app_background {10, 12, 16, 255};
-  const Color viewport_background {14, 17, 21, 255};
-  const Color panel_edge {54, 61, 73, 255};
-  const Color grid {34, 39, 48, 255};
-  const Color text {228, 233, 241, 255};
-  const Color muted {132, 141, 154, 255};
-  const Color structure {176, 184, 194, 255};
-  const Color earth_frame {149, 164, 182, 255};
-  const Color traveler_frame {214, 221, 230, 255};
-  const Color earth_body {114, 133, 164, 255};
-  const Color destination_body {176, 167, 144, 255};
-  const Color warning {220, 197, 136, 255};
+  const AppColors colors {
+      .app_background = {10, 12, 16, 255},
+      .viewport_background = {14, 17, 21, 255},
+      .panel_edge = {54, 61, 73, 255},
+      .grid = {34, 39, 48, 255},
+      .text = {228, 233, 241, 255},
+      .muted = {132, 141, 154, 255},
+      .structure = {176, 184, 194, 255},
+      .earth_frame = {149, 164, 182, 255},
+      .traveler_frame = {214, 221, 230, 255},
+      .earth_body = {114, 133, 164, 255},
+      .destination_body = {176, 167, 144, 255},
+      .warning = {220, 197, 136, 255},
+  };
 
   bool custom_font_loaded = false;
   const Font ui_font = LoadUiFont(custom_font_loaded);
-  RenderTexture2D scene_target = LoadRenderTexture(static_cast<int>(viewport.width), static_cast<int>(viewport.height));
-  SetTextureFilter(scene_target.texture, TEXTURE_FILTER_BILINEAR);
-  Shader lighting_shader = LoadShaderFromMemory(kLightingVertexShader, kLightingFragmentShader);
-  const int ambient_location = GetShaderLocation(lighting_shader, "ambient");
-  const int view_position_location = GetShaderLocation(lighting_shader, "viewPos");
-  const float ambient_value[4] {0.22F, 0.24F, 0.28F, 1.0F};
-  SetShaderValue(lighting_shader, ambient_location, ambient_value, SHADER_UNIFORM_VEC4);
-
-  Camera3D camera {};
-  Vector3 camera_target {0.0F, 0.15F, 0.0F};
-  float camera_distance = 24.0F;
-  float camera_yaw = -0.42F;
-  float camera_pitch = 0.24F;
-  camera.position = CameraPositionFromOrbit(camera_target, camera_distance, camera_yaw, camera_pitch);
-  camera.target = camera_target;
-  camera.up = {0.0F, 1.0F, 0.0F};
-  camera.fovy = 38.0F;
-  camera.projection = CAMERA_PERSPECTIVE;
-
-  const Vector3 earth_world {-10.5F, 2.2F, -4.8F};
-  const Vector3 turnaround_world {0.0F, 0.8F, 0.0F};
-  const Vector3 destination_world {10.5F, -1.9F, 4.8F};
-  const Vector3 world_up {0.0F, 1.0F, 0.0F};
-  const Vector3 turnaround_curve_world = QuadraticBezierPoint(earth_world, turnaround_world, destination_world, 0.5F);
-  ShaderLight lights[3] {
-      CreateShaderLight(0, 0, {-8.5F, 11.0F, 10.0F}, {0.0F, 0.0F, 0.0F}, Color {240, 244, 255, 255}, lighting_shader),
-      CreateShaderLight(1, 1, {8.5F, 4.5F, 5.5F}, {0.0F, 0.0F, 0.0F}, Color {196, 212, 255, 255}, lighting_shader),
-      CreateShaderLight(2, 1, {-2.5F, 2.0F, -8.0F}, {0.0F, 0.0F, 0.0F}, Color {198, 186, 170, 255}, lighting_shader),
-  };
-
-  Model proper_time_rate_tube_model {};
-  bool proper_time_rate_tube_ready = false;
-  std::size_t proper_time_rate_tube_index = std::numeric_limits<std::size_t>::max();
+  DashboardUI ui(ui_font, mission, mission_name, destination_name, coordinate_pulse_interval, proper_pulse_interval,
+                 cosmology_note, colors);
+  MissionScene scene(mission, ui.Layout().viewport, colors);
+  RelativisticCamera camera;
 
   bool playing = false;
   bool dragging_slider = false;
@@ -860,15 +1579,15 @@ int main(int argc, char** argv) {
     const float dt = GetFrameTime();
     const Vector2 mouse = GetMousePosition();
     const Vector2 mouse_delta = GetMouseDelta();
-    const bool mouse_in_viewport = CheckCollisionPointRec(mouse, viewport);
+    const bool mouse_in_viewport = CheckCollisionPointRec(mouse, ui.Layout().viewport);
 
-    if (ButtonClicked(play_button, mouse) || IsKeyPressed(KEY_SPACE)) {
+    if (ButtonClicked(ui.Layout().play_button, mouse) || IsKeyPressed(KEY_SPACE)) {
       if (stage >= 1.0F) {
         stage = 0.0F;
       }
       playing = !playing;
     }
-    if (ButtonClicked(reset_button, mouse) || IsKeyPressed(KEY_HOME)) {
+    if (ButtonClicked(ui.Layout().reset_button, mouse) || IsKeyPressed(KEY_HOME)) {
       stage = 0.0F;
       playing = false;
     }
@@ -876,14 +1595,18 @@ int main(int argc, char** argv) {
       stage = 1.0F;
       playing = false;
     }
+    if (IsKeyPressed(KEY_F)) {
+      camera.ToggleMode();
+    }
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, ExpandedRect(slider_track, 12.0F))) {
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        CheckCollisionPointRec(mouse, ExpandedRect(ui.Layout().slider_track, 12.0F))) {
       dragging_slider = true;
       playing = false;
     }
 
     if (dragging_slider) {
-      stage = SliderStageFromMouse(slider_track, mouse);
+      stage = SliderStageFromMouse(ui.Layout().slider_track, mouse);
       if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
         dragging_slider = false;
       }
@@ -902,31 +1625,18 @@ int main(int argc, char** argv) {
 
     const float wheel = GetMouseWheelMove();
     if (wheel != 0.0F) {
-      if (mouse_in_viewport) {
-        camera_distance = std::clamp(camera_distance - (wheel * 1.15F), 7.5F, 34.0F);
+      if (mouse_in_viewport && !camera.IsCockpitMode()) {
+        camera.HandleViewportInput(true, {0.0F, 0.0F}, wheel, dt);
       } else {
         stage = Clamp01(stage + (wheel * 0.009F));
         playing = false;
       }
     }
 
-    if (mouse_in_viewport && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-      camera_yaw -= mouse_delta.x * 0.0065F;
-      camera_pitch = std::clamp(camera_pitch - (mouse_delta.y * 0.0045F), -0.25F, 1.10F);
-    }
-
-    if (mouse_in_viewport && IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
-      const Vector3 forward = Normalize(Subtract(camera.target, camera.position));
-      const Vector3 right {forward.z, 0.0F, -forward.x};
-      const Vector3 pan_offset = Add(Scale(right, -mouse_delta.x * 0.018F), Scale(world_up, mouse_delta.y * 0.018F));
-      camera_target = Add(camera_target, pan_offset);
-    }
+    camera.HandleViewportInput(mouse_in_viewport, mouse_delta, 0.0F, dt);
 
     if (IsKeyPressed(KEY_C)) {
-      camera_target = {0.0F, 0.15F, 0.0F};
-      camera_distance = 24.0F;
-      camera_yaw = -0.42F;
-      camera_pitch = 0.24F;
+      camera.ResetView();
     }
     if (IsKeyPressed(KEY_E)) {
       export_requested = true;
@@ -939,205 +1649,27 @@ int main(int argc, char** argv) {
       }
     }
 
-    camera.position = CameraPositionFromOrbit(camera_target, camera_distance, camera_yaw, camera_pitch);
-    camera.target = camera_target;
-
     const std::size_t current_index = std::min(
         mission.samples.size() - 1,
         static_cast<std::size_t>(std::round(stage * static_cast<float>(mission.samples.size() - 1))));
     const auto& current = mission.samples[current_index];
+    const PathFrame ship_frame = scene.ShipFrame(current);
+    camera.UpdateFromShip(ship_frame);
 
-    if ((current_index != proper_time_rate_tube_index) && (current_index > 1)) {
-      if (proper_time_rate_tube_ready) {
-        UnloadModel(proper_time_rate_tube_model);
-        proper_time_rate_tube_ready = false;
-      }
-      proper_time_rate_tube_model =
-          BuildProperTimeRateTubeModel(mission, current_index, earth_world, turnaround_world, destination_world, 48);
-      proper_time_rate_tube_model.materials[0].shader = lighting_shader;
-      proper_time_rate_tube_ready = true;
-      proper_time_rate_tube_index = current_index;
-    }
-
-    const float travel_fraction = static_cast<float>(current.position_ly / mission.profile.distance_ly);
-    const PathFrame ship_frame = EvaluatePathFrame(earth_world, turnaround_world, destination_world, travel_fraction,
-                                                   ProperTimeRateTubeRadius(current.proper_time_rate));
-    const bool decelerating_phase = current.signed_proper_acceleration_ly_per_year2 < 0.0;
-    const Vector3 ship_world = ship_frame.center;
-    const Vector3 acceleration_offset_start = Add(ship_world, {0.0F, 0.78F, 0.0F});
-    const float acceleration_vector_length = 0.86F + (1.55F * static_cast<float>(current.beta));
-    const float acceleration_direction_sign = decelerating_phase ? -1.0F : 1.0F;
-    const Vector3 acceleration_vector_end =
-        Add(acceleration_offset_start, Scale(ship_frame.tangent, acceleration_vector_length * acceleration_direction_sign));
-    const Vector2 earth_label = GetWorldToScreenEx(earth_world, camera, static_cast<int>(viewport.width),
-                                                   static_cast<int>(viewport.height));
-    const Vector2 destination_label = GetWorldToScreenEx(destination_world, camera, static_cast<int>(viewport.width),
-                                                         static_cast<int>(viewport.height));
-    const Vector2 turnaround_label = GetWorldToScreenEx(turnaround_curve_world, camera, static_cast<int>(viewport.width),
-                                                        static_cast<int>(viewport.height));
-    const std::vector<PulseMarker> coordinate_pulses =
-        BuildPulseMarkers(mission, current_index, coordinate_pulse_interval, TimeDomain::Coordinate);
-    const std::vector<PulseMarker> proper_pulses =
-        BuildPulseMarkers(mission, current_index, proper_pulse_interval, TimeDomain::Proper);
+    scene.Render(camera, current, current_index, coordinate_pulse_interval, proper_pulse_interval);
+    const SceneLabels labels = scene.ProjectLabels(camera.ActiveCamera());
 
     BeginDrawing();
-    ClearBackground(app_background);
-
-    DrawUiText(ui_font, "Relativity Mission Control", 40.0F, 26.0F, 24.0F, text);
-    DrawUiText(ui_font, mission_name + "    " + FormatFixed(mission.profile.distance_ly, 2) + " ly"
-                           + "    beta_max " + FormatFixed(mission.summary.peak_beta, 2),
-               42.0F, 56.0F, 15.0F, muted);
-
-    BeginTextureMode(scene_target);
-    ClearBackground(viewport_background);
-    BeginMode3D(camera);
-
-    const float view_position[3] {camera.position.x, camera.position.y, camera.position.z};
-    SetShaderValue(lighting_shader, view_position_location, view_position, SHADER_UNIFORM_VEC3);
-    for (const auto& light : lights) {
-      UpdateShaderLight(lighting_shader, light);
-    }
-
-    DrawGrid(24, 1.5F);
-    DrawTrajectoryCurve(earth_world, turnaround_world, destination_world, 1.0F, 90, Fade(grid, 0.28F));
-    DrawTrajectoryCurve(earth_world, turnaround_world, destination_world, travel_fraction, 90, Fade(structure, 0.32F));
-    DrawSphereEx(earth_world, 0.46F, 18, 18, earth_body);
-    DrawSphereEx(destination_world, 0.38F, 18, 18, destination_body);
-    DrawSphereWires(earth_world, 0.46F, 12, 12, Fade(structure, 0.65F));
-    DrawSphereWires(destination_world, 0.38F, 12, 12, Fade(structure, 0.52F));
-
-    if (proper_time_rate_tube_ready) {
-      DrawModel(proper_time_rate_tube_model, {0.0F, 0.0F, 0.0F}, 1.0F, Fade(traveler_frame, 0.26F));
-      DrawModelWires(proper_time_rate_tube_model, {0.0F, 0.0F, 0.0F}, 1.0F, Fade(traveler_frame, 0.54F));
-    }
-
-    for (const auto& marker : coordinate_pulses) {
-      const PathFrame frame = EvaluatePathFrame(earth_world, turnaround_world, destination_world, marker.path_fraction,
-                                                marker.proper_time_rate_radius);
-      const float radius = std::max(frame.proper_time_rate_radius + 0.30F, frame.proper_time_rate_radius * 1.18F);
-      DrawRingSegments(frame, radius, 0.016F, Fade(earth_frame, 0.36F), 28);
-    }
-
-    for (const auto& marker : proper_pulses) {
-      const PathFrame frame = EvaluatePathFrame(earth_world, turnaround_world, destination_world, marker.path_fraction,
-                                                marker.proper_time_rate_radius);
-      DrawRingSegments(frame, frame.proper_time_rate_radius + 0.03F, 0.030F, Fade(traveler_frame, 0.70F), 28);
-    }
-
-    const Vector3 probe_tail = Add(ship_world, Scale(ship_frame.tangent, -0.65F));
-    const Vector3 probe_nose = Add(ship_world, Scale(ship_frame.tangent, 0.65F));
-    DrawCylinderEx(probe_tail, probe_nose, 0.16F, 0.08F, 12, Fade(text, 0.96F));
-    DrawSphereEx(ship_world, 0.15F, 10, 10, Fade(app_background, 0.92F));
-    DrawCylinderEx(acceleration_offset_start, acceleration_vector_end, 0.03F, 0.03F, 10, traveler_frame);
-    DrawCylinderEx(Add(acceleration_vector_end, Scale(ship_frame.tangent, -0.18F)), acceleration_vector_end, 0.10F, 0.0F,
-                   10, traveler_frame);
-
-    EndMode3D();
-    EndTextureMode();
-
-    DrawPanel(viewport, viewport_background, panel_edge);
-    DrawTexturePro(scene_target.texture, {0.0F, 0.0F, static_cast<float>(scene_target.texture.width),
-                                          -static_cast<float>(scene_target.texture.height)},
-                   viewport, {0.0F, 0.0F}, 0.0F, WHITE);
-    DrawRectangleRoundedLinesEx(viewport, 0.015F, 10, 1.0F, panel_edge);
-
-    DrawPanel(mission_panel, Color {19, 23, 29, 184}, Fade(panel_edge, 0.60F));
-    DrawPanel(frames_panel, Color {19, 23, 29, 184}, Fade(panel_edge, 0.60F));
-
-    DrawUiText(ui_font, "Earth", viewport.x + earth_label.x - 18.0F, viewport.y + earth_label.y - 42.0F, 18.0F, structure);
-    DrawUiText(ui_font, destination_name, viewport.x + destination_label.x - 56.0F, viewport.y + destination_label.y + 18.0F,
-               16.0F, structure);
-
-    if (current.progress >= 0.42) {
-      DrawUiText(ui_font, "Turnaround Event", viewport.x + turnaround_label.x + 24.0F,
-                 viewport.y + turnaround_label.y - 10.0F, 15.0F, text);
-    }
-
-    DrawUiText(ui_font, "Mission State", mission_panel.x + 16.0F, mission_panel.y + 14.0F, 16.0F, muted);
-    DrawUiText(ui_font, "phase", mission_panel.x + 16.0F, mission_panel.y + 44.0F, 14.0F, muted);
-    DrawUiText(ui_font, std::string(PhaseLabel(current.progress)), mission_panel.x + 112.0F, mission_panel.y + 44.0F, 14.0F,
-               text);
-    DrawUiText(ui_font, "beta", mission_panel.x + 16.0F, mission_panel.y + 72.0F, 14.0F, muted);
-    DrawUiText(ui_font, FormatFixed(current.beta, 3), mission_panel.x + 112.0F, mission_panel.y + 72.0F, 14.0F, text);
-    DrawUiText(ui_font, "Lorentz factor", mission_panel.x + 16.0F, mission_panel.y + 100.0F, 14.0F, muted);
-    DrawUiText(ui_font, FormatFixed(current.gamma, 4), mission_panel.x + 112.0F, mission_panel.y + 100.0F, 14.0F, text);
-    DrawUiText(ui_font, "proper-time rate", mission_panel.x + 16.0F, mission_panel.y + 128.0F, 14.0F, muted);
-    DrawUiText(ui_font, FormatFixed(current.proper_time_rate, 4), mission_panel.x + 112.0F, mission_panel.y + 128.0F, 14.0F,
-               text);
-    DrawUiText(ui_font, DynamicsLabel(current.signed_proper_acceleration_ly_per_year2), mission_panel.x + 16.0F,
-               mission_panel.y + 156.0F, 13.0F, muted);
-    DrawUiText(ui_font,
-               FormatFixed(std::abs(current.signed_proper_acceleration_ly_per_year2), 3) + " ly / y^2",
-               mission_panel.x + 16.0F, mission_panel.y + 174.0F, 13.0F, text);
-
-    const Rectangle earth_rail {frames_panel.x + 24.0F, frames_panel.y + 62.0F, 28.0F, 116.0F};
-    const Rectangle traveler_rail {frames_panel.x + 138.0F, frames_panel.y + 62.0F, 28.0F, 116.0F};
-    const float earth_progress = static_cast<float>(current.coordinate_time_years / mission.summary.coordinate_time_years);
-    const float traveler_progress = static_cast<float>(current.proper_time_years / mission.summary.coordinate_time_years);
-    const float earth_marker_y = earth_rail.y + earth_rail.height - (earth_rail.height * earth_progress);
-    const float traveler_marker_y = traveler_rail.y + traveler_rail.height - (traveler_rail.height * traveler_progress);
-
-    DrawUiText(ui_font, "Frame Times", frames_panel.x + 16.0F, frames_panel.y + 14.0F, 16.0F, muted);
-    DrawUiText(ui_font, "Earth", earth_rail.x - 2.0F, earth_rail.y - 24.0F, 13.0F, earth_frame);
-    DrawUiText(ui_font, "Traveler", traveler_rail.x - 8.0F, traveler_rail.y - 24.0F, 13.0F, traveler_frame);
-
-    DrawRectangleRounded(earth_rail, 0.2F, 8, Fade(earth_frame, 0.07F));
-    DrawRectangleRoundedLinesEx(earth_rail, 0.2F, 8, 1.0F, Fade(earth_frame, 0.42F));
-    DrawRectangleRounded({earth_rail.x, earth_rail.y + earth_rail.height - (earth_rail.height * earth_progress),
-                          earth_rail.width, earth_rail.height * earth_progress},
-                         0.2F, 8, Fade(earth_frame, 0.30F));
-
-    DrawRectangleRounded(traveler_rail, 0.2F, 8, Fade(traveler_frame, 0.07F));
-    DrawRectangleRoundedLinesEx(traveler_rail, 0.2F, 8, 1.0F, Fade(traveler_frame, 0.48F));
-    DrawRectangleRounded({traveler_rail.x, traveler_rail.y + traveler_rail.height - (traveler_rail.height * traveler_progress),
-                          traveler_rail.width, traveler_rail.height * traveler_progress},
-                         0.2F, 8, Fade(traveler_frame, 0.32F));
-
-    DrawLineEx({earth_rail.x - 10.0F, earth_marker_y}, {earth_rail.x + earth_rail.width + 10.0F, earth_marker_y}, 2.0F,
-               earth_frame);
-    DrawLineEx({traveler_rail.x - 10.0F, traveler_marker_y},
-               {traveler_rail.x + traveler_rail.width + 10.0F, traveler_marker_y}, 2.0F, traveler_frame);
-
-    DrawUiText(ui_font, FormatFixed(current.coordinate_time_years, 2) + " y", earth_rail.x - 12.0F,
-               earth_rail.y + earth_rail.height + 10.0F, 14.0F, text);
-    DrawUiText(ui_font, FormatFixed(current.proper_time_years, 2) + " y", traveler_rail.x - 10.0F,
-               traveler_rail.y + traveler_rail.height + 10.0F, 14.0F, text);
-
-    DrawUiText(ui_font, "delta", frames_panel.x + 16.0F, frames_panel.y + 200.0F, 13.0F, muted);
-    DrawUiText(ui_font, FormatFixed(current.coordinate_time_years - current.proper_time_years, 3) + " y",
-               frames_panel.x + 92.0F, frames_panel.y + 200.0F, 13.0F, traveler_frame);
-
-    DrawRectangleRounded(controls, 0.04F, 10, viewport_background);
-    DrawRectangleRoundedLinesEx(controls, 0.04F, 10, 1.0F, panel_edge);
-
-    DrawButton(ui_font, play_button, playing ? "Pause" : "Play", playing, CheckCollisionPointRec(mouse, play_button),
-               traveler_frame, traveler_frame, app_background);
-    DrawButton(ui_font, reset_button, "Reset", false, CheckCollisionPointRec(mouse, reset_button),
-               Color {88, 96, 108, 255}, panel_edge, text);
-
-    DrawRectangleRounded(slider_track, 1.0F, 16, Color {44, 49, 57, 255});
-    DrawRectangleRounded({slider_track.x, slider_track.y, slider_track.width * stage, slider_track.height}, 1.0F, 16,
-                         traveler_frame);
-    const Vector2 knob_center {slider_track.x + (slider_track.width * stage), slider_track.y + (slider_track.height * 0.5F)};
-    DrawCircleV(knob_center, 8.0F, text);
-    DrawCircleV(knob_center, 3.0F, app_background);
-
-    DrawUiText(ui_font, "Playback", 304.0F, 730.0F, 17.0F, muted);
-    DrawUiText(ui_font, "Space play/pause    Left/Right scrub    wheel over scene zooms    C resets camera", 948.0F,
-               730.0F, 14.0F, muted);
-    DrawUiText(ui_font, "Right-drag orbit    Middle-drag pan    End jump to arrival    E export PNGs", 900.0F, 748.0F,
-               14.0F, muted);
-    DrawUiText(ui_font, cosmology_note ? "SR model only; cosmology not included." : "SR model only.", 470.0F, 748.0F, 14.0F,
-               cosmology_note ? warning : muted);
-
+    ClearBackground(colors.app_background);
+    ui.Draw(scene.RenderTarget(), current, stage, playing, mouse, camera.ModeLabel(), camera.IsCockpitMode(), labels,
+            current.progress >= 0.42);
     EndDrawing();
 
     if (export_requested) {
       const std::string export_prefix = auto_export ? options.export_prefix : "mission_export";
       const bool export_ok =
-          ExportMissionArtifacts(export_prefix, ui_font, scene_target, mission, mission_name, destination_name,
-                                 coordinate_pulse_interval, proper_pulse_interval, cosmology_note, app_background,
-                                 viewport_background, panel_edge, text, muted, earth_frame, traveler_frame, warning);
+          ExportMissionArtifacts(export_prefix, ui_font, scene.RenderTarget(), mission, mission_name, destination_name,
+                                 coordinate_pulse_interval, proper_pulse_interval, cosmology_note, colors);
       if (!export_ok) {
         TraceLog(LOG_WARNING, "png export failed");
       }
@@ -1151,11 +1683,6 @@ int main(int argc, char** argv) {
   if (custom_font_loaded) {
     UnloadFont(ui_font);
   }
-  if (proper_time_rate_tube_ready) {
-    UnloadModel(proper_time_rate_tube_model);
-  }
-  UnloadShader(lighting_shader);
-  UnloadRenderTexture(scene_target);
 
   CloseWindow();
   return 0;

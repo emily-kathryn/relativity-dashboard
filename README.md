@@ -34,9 +34,10 @@ For a one-way mission with total Earth-frame distance `D` and midpoint peak spee
 - Rapidity: `eta = atanh(beta)`
 - Proper acceleration for the symmetric half-trip:
   `a = (gamma - 1) / (D / 2)`
-- During acceleration:
-  `x(tau) = (cosh(a tau) - 1) / a`
-  `t(tau) = sinh(a tau) / a`
+- State vector: `[tau, t, x, eta]`
+- Integrated equations of motion in proper time:
+  `deta / dtau = a(tau)`, `dx / dtau = sinh(eta)`, `dt / dtau = cosh(eta)`
+- The current presets still use the symmetric constant-proper-acceleration mission, but the sampler now uses RK4 so non-constant proper-acceleration profiles can be added later without changing the simulation structure.
 - Proper time still comes from the worldline, so the traveler ages less than the Earth frame across the same trip.
 
 The visualizer now renders a single cinematic scene:
@@ -44,7 +45,8 @@ The visualizer now renders a single cinematic scene:
 - a proper-time-rate world-tube whose radius follows `dτ/dt = 1 / gamma`
 - traveler proper-time pulse rings and Earth-frame coordinate-time pulse rings
 - a ship accelerating away from Earth and braking toward the destination
-- frame-specific overlays for Earth-frame and traveler-frame quantities
+- a first-person cockpit mode with relativistic aberration, Doppler shift, and beaming in the starfield
+- frame-specific overlays for Earth-frame and traveler-frame quantities, including a simultaneity dashboard
 - direct playback controls and a mission-stage scrubber
 
 ## Project Layout
@@ -136,7 +138,12 @@ Visualizer controls:
 - mouse wheel over the viewport: 3D zoom
 - right-drag in the viewport: orbit camera
 - middle-drag in the viewport: pan camera
-- `C`: reset camera
+- `W` / `A` / `S` / `D`: translate the third-person view target
+- `Q` / `Z`: move the third-person view target up or down
+- `F`: toggle cockpit mode
+- right-drag in cockpit mode: look around from the traveler frame
+- `I` / `J` / `K` / `L`: cockpit look-around with the keyboard
+- `C`: reset view and cockpit look direction
 - `E`: export `mission_export_summary.png` and `mission_export_visual.png` from the current view
 - `End`: jump to arrival
 
