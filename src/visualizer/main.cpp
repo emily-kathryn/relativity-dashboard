@@ -190,6 +190,33 @@ float StarLayer(vec3 worldDir, vec2 scale, float threshold, float radiusScale, o
     return star;
 }
 
+float Noise21(vec2 p)
+{
+    vec2 cell = floor(p);
+    vec2 local = fract(p);
+    local = local * local * (3.0 - 2.0 * local);
+
+    float a = Hash12(cell);
+    float b = Hash12(cell + vec2(1.0, 0.0));
+    float c = Hash12(cell + vec2(0.0, 1.0));
+    float d = Hash12(cell + vec2(1.0, 1.0));
+
+    return mix(mix(a, b, local.x), mix(c, d, local.x), local.y);
+}
+
+float FractalNoise(vec2 p)
+{
+    float sum = 0.0;
+    float amplitude = 0.5;
+    for (int octave = 0; octave < 4; ++octave)
+    {
+        sum += Noise21(p) * amplitude;
+        p = p * 2.03 + vec2(13.7, 8.1);
+        amplitude *= 0.5;
+    }
+    return sum;
+}
+
 void main()
 {
     vec2 uv = fragTexCoord * 2.0 - 1.0;
@@ -204,17 +231,31 @@ void main()
 
     float seedA = 0.0;
     float seedB = 0.0;
-    float starA = StarLayer(worldDir, vec2(180.0, 96.0), 0.992, 1.00, seedA);
-    float starB = StarLayer(worldDir, vec2(320.0, 176.0), 0.997, 0.72, seedB);
-    float starIntensity = (starA + starB) * beaming;
+    float seedC = 0.0;
+    float starA = StarLayer(worldDir, vec2(150.0, 84.0), 0.982, 1.10, seedA);
+    float starB = StarLayer(worldDir, vec2(260.0, 144.0), 0.991, 0.80, seedB);
+    float starC = StarLayer(worldDir, vec2(430.0, 240.0), 0.9975, 0.56, seedC);
+    float starIntensity = (starA * 0.95 + starB * 0.75 + starC * 0.42) * (0.55 + 0.45 * beaming);
 
-    float horizonGlow = pow(max(0.0, 1.0 - abs(worldDir.y)), 7.0) * 0.025;
-    float forwardGlow = pow(max(0.0, cosTheta), 10.0) * 0.06 * beaming;
-    vec3 background = vec3(0.006, 0.008, 0.012) + horizonGlow * vec3(0.10, 0.11, 0.14) +
-                      forwardGlow * vec3(0.18, 0.20, 0.26);
+    float azimuth = atan(worldDir.z, worldDir.x) / (2.0 * PI) + 0.5;
+    float polar = acos(clamp(worldDir.y, -1.0, 1.0)) / PI;
+    vec2 skyUv = vec2(azimuth, polar);
+    vec3 galacticAxis = normalize(vec3(0.32, 0.87, -0.37));
+    float galacticBand = pow(max(0.0, 1.0 - abs(dot(worldDir, galacticAxis))), 6.0);
+    float galacticNoise = FractalNoise(skyUv * vec2(8.0, 18.0));
+    float dustNoise = FractalNoise((skyUv + vec2(0.13, 0.27)) * vec2(22.0, 34.0));
+    float horizonGlow = pow(max(0.0, 1.0 - abs(worldDir.y)), 5.0) * 0.060;
+    float forwardGlow = pow(max(0.0, cosTheta), 7.0) * 0.12 * beaming;
+    vec3 background = vec3(0.018, 0.022, 0.031)
+                    + horizonGlow * vec3(0.10, 0.11, 0.14)
+                    + forwardGlow * vec3(0.24, 0.26, 0.34);
+    vec3 galacticColor = vec3(0.12, 0.14, 0.18) * galacticBand * (0.30 + 0.70 * galacticNoise);
+    vec3 dustColor = vec3(0.05, 0.06, 0.08) * galacticBand * smoothstep(0.52, 0.88, dustNoise) * 0.55;
 
-    vec3 starColor = starA * DopplerTint(doppler, seedA) + starB * DopplerTint(doppler, seedB);
-    vec3 color = background + starColor * starIntensity;
+    vec3 starColor = starA * DopplerTint(doppler, seedA)
+                   + starB * DopplerTint(doppler * 0.96, seedB)
+                   + starC * DopplerTint(doppler * 1.03, seedC);
+    vec3 color = background + galacticColor + dustColor + starColor * starIntensity;
 
     finalColor = vec4(clamp(color, 0.0, 1.0), 1.0) * fragColor;
 }
@@ -441,6 +482,20 @@ bool ButtonClicked(const Rectangle& bounds, const Vector2 mouse) {
 void DrawPanel(const Rectangle& bounds, Color fill, Color outline) {
   DrawRectangleRounded(bounds, 0.12F, 10, fill);
   DrawRectangleRoundedLinesEx(bounds, 0.12F, 10, 1.0F, outline);
+}
+
+bool ContainsRect(const Rectangle& outer, const Rectangle& inner) {
+  return inner.x >= outer.x && inner.y >= outer.y && (inner.x + inner.width) <= (outer.x + outer.width)
+         && (inner.y + inner.height) <= (outer.y + outer.height);
+}
+
+bool IntersectsAny(const Rectangle& candidate, const std::array<Rectangle, 3>& blockers) {
+  for (const Rectangle& blocker : blockers) {
+    if (CheckCollisionRecs(candidate, blocker)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void DrawButton(const Font& font, const Rectangle& bounds, const char* label, bool active, bool hover, Color fill,
@@ -919,6 +974,13 @@ bool ExportMissionArtifacts(std::string_view export_prefix, const Font& ui_font,
 
 class RelativisticCamera {
  public:
+  enum class ThirdPersonPreset {
+    Isometric,
+    Broadside,
+    Forward,
+    Overhead,
+  };
+
   RelativisticCamera() {
     ResetView();
   }
@@ -927,11 +989,34 @@ class RelativisticCamera {
     mode_ = mode_ == ViewMode::ThirdPerson ? ViewMode::Cockpit : ViewMode::ThirdPerson;
   }
 
+  void SnapToThirdPersonPreset(ThirdPersonPreset preset) {
+    switch (preset) {
+      case ThirdPersonPreset::Isometric:
+        third_person_distance_ = 24.0F;
+        third_person_yaw_ = -0.42F;
+        third_person_pitch_ = 0.24F;
+        break;
+      case ThirdPersonPreset::Broadside:
+        third_person_distance_ = 20.5F;
+        third_person_yaw_ = -1.56F;
+        third_person_pitch_ = 0.20F;
+        break;
+      case ThirdPersonPreset::Forward:
+        third_person_distance_ = 18.0F;
+        third_person_yaw_ = 0.88F;
+        third_person_pitch_ = 0.12F;
+        break;
+      case ThirdPersonPreset::Overhead:
+        third_person_distance_ = 26.0F;
+        third_person_yaw_ = -0.42F;
+        third_person_pitch_ = 1.04F;
+        break;
+    }
+    CommitThirdPersonCamera();
+  }
+
   void ResetView() {
     third_person_target_ = {0.0F, 0.15F, 0.0F};
-    third_person_distance_ = 24.0F;
-    third_person_yaw_ = -0.42F;
-    third_person_pitch_ = 0.24F;
     third_person_camera_.target = third_person_target_;
     third_person_camera_.up = {0.0F, 1.0F, 0.0F};
     third_person_camera_.fovy = 38.0F;
@@ -941,7 +1026,7 @@ class RelativisticCamera {
     cockpit_camera_.up = {0.0F, 1.0F, 0.0F};
     cockpit_camera_.fovy = 72.0F;
     cockpit_camera_.projection = CAMERA_PERSPECTIVE;
-    CommitThirdPersonCamera();
+    SnapToThirdPersonPreset(ThirdPersonPreset::Isometric);
   }
 
   void HandleViewportInput(bool mouse_in_viewport, Vector2 mouse_delta, float wheel, float dt) {
@@ -975,7 +1060,7 @@ class RelativisticCamera {
   }
 
   std::string_view ModeLabel() const {
-    return mode_ == ViewMode::Cockpit ? "Cockpit Mode" : "Third-Person View";
+    return mode_ == ViewMode::Cockpit ? "Traveler View" : "Third-Person View";
   }
 
  private:
@@ -1269,11 +1354,17 @@ class MissionScene {
     EndShaderMode();
 
     const Vector2 center {viewport_.width * 0.5F, viewport_.height * 0.5F};
+    DrawRectangleGradientV(0, 0, static_cast<int>(viewport_.width), static_cast<int>(viewport_.height),
+                           Fade(colors_.app_background, 0.00F), Fade(colors_.app_background, 0.18F));
     DrawCircleLinesV(center, 18.0F, Fade(colors_.traveler_frame, 0.65F));
     DrawLineEx({center.x - 30.0F, center.y}, {center.x - 8.0F, center.y}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
     DrawLineEx({center.x + 8.0F, center.y}, {center.x + 30.0F, center.y}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
     DrawLineEx({center.x, center.y - 30.0F}, {center.x, center.y - 8.0F}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
     DrawLineEx({center.x, center.y + 8.0F}, {center.x, center.y + 30.0F}, 1.6F, Fade(colors_.traveler_frame, 0.55F));
+    DrawUiText(GetFontDefault(), "Traveler View", 18.0F, 16.0F, 18.0F, Fade(colors_.traveler_frame, 0.82F));
+    DrawUiText(GetFontDefault(), "Relativistic sky only", 18.0F, 38.0F, 12.0F, Fade(colors_.muted, 0.92F));
+    DrawUiText(GetFontDefault(), "beta " + FormatFixed(current.beta, 3) + "   gamma " + FormatFixed(current.gamma, 3),
+               viewport_.width - 226.0F, 18.0F, 13.0F, Fade(colors_.traveler_frame, 0.82F));
   }
 
   const relativity::MissionResult& mission_;
@@ -1322,7 +1413,7 @@ class DashboardUI {
 
   void Draw(const RenderTexture2D& scene_target, const relativity::WorldlineSample& current, float stage, bool playing,
             const Vector2 mouse, std::string_view view_mode_label, bool cockpit_mode, const SceneLabels& labels,
-            bool show_turnaround_label) const {
+            bool show_turnaround_label, bool show_help) const {
     DrawUiText(ui_font_, "Relativity Mission Control", 40.0F, 26.0F, 24.0F, colors_.text);
     DrawUiText(ui_font_,
                mission_name_ + "    " + FormatFixed(mission_.profile.distance_ly, 2) + " ly"
@@ -1338,14 +1429,16 @@ class DashboardUI {
     DrawRectangleRoundedLinesEx(layout_.viewport, 0.015F, 10, 1.0F, colors_.panel_edge);
 
     if (!cockpit_mode) {
-      DrawUiText(ui_font_, "Earth", layout_.viewport.x + labels.earth.x - 18.0F, layout_.viewport.y + labels.earth.y - 42.0F,
-                 18.0F, colors_.structure);
-      DrawUiText(ui_font_, destination_name_, layout_.viewport.x + labels.destination.x - 56.0F,
-                 layout_.viewport.y + labels.destination.y + 18.0F, 16.0F, colors_.structure);
+      const std::array<Rectangle, 3> overlay_exclusions {
+          ExpandedRect(layout_.mission_panel, 10.0F),
+          ExpandedRect(layout_.frames_panel, 10.0F),
+          ExpandedRect(layout_.simultaneity_panel, 10.0F),
+      };
+      DrawWorldLabel("Earth", labels.earth, 18.0F, colors_.structure, overlay_exclusions);
+      DrawWorldLabel(destination_name_, labels.destination, 16.0F, colors_.structure, overlay_exclusions);
 
       if (show_turnaround_label) {
-        DrawUiText(ui_font_, "Turnaround Event", layout_.viewport.x + labels.turnaround.x + 24.0F,
-                   layout_.viewport.y + labels.turnaround.y - 10.0F, 15.0F, colors_.text);
+        DrawWorldLabel("Turnaround Event", labels.turnaround, 15.0F, colors_.text, overlay_exclusions);
       }
     }
 
@@ -1353,9 +1446,44 @@ class DashboardUI {
     DrawFrameTimesPanel(current);
     DrawSimultaneityPanel(current, cockpit_mode);
     DrawControls(stage, playing, mouse, cockpit_mode);
+    if (show_help) {
+      DrawHelpOverlay(cockpit_mode);
+    }
   }
 
  private:
+  void DrawWorldLabel(const std::string& text, Vector2 viewport_anchor, float size, Color text_color,
+                      const std::array<Rectangle, 3>& overlay_exclusions) const {
+    const Vector2 anchor {layout_.viewport.x + viewport_anchor.x, layout_.viewport.y + viewport_anchor.y};
+    if (!CheckCollisionPointRec(anchor, layout_.viewport)) {
+      return;
+    }
+
+    const float text_width = MeasureUiText(ui_font_, text.c_str(), size);
+    const float text_height = size + 4.0F;
+    const std::array<Vector2, 6> offsets {
+        Vector2 {-text_width * 0.5F, -text_height - 18.0F},
+        Vector2 {14.0F, -text_height - 10.0F},
+        Vector2 {14.0F, 8.0F},
+        Vector2 {-text_width - 14.0F, 8.0F},
+        Vector2 {-text_width - 14.0F, -text_height - 10.0F},
+        Vector2 {-text_width * 0.5F, 10.0F},
+    };
+
+    for (const Vector2& offset : offsets) {
+      const Rectangle text_bounds {anchor.x + offset.x, anchor.y + offset.y, text_width, text_height};
+      const Rectangle chip_bounds = ExpandedRect(text_bounds, 7.0F);
+      if (!ContainsRect(layout_.viewport, chip_bounds) || IntersectsAny(chip_bounds, overlay_exclusions)) {
+        continue;
+      }
+
+      DrawRectangleRounded(chip_bounds, 0.20F, 8, Fade(colors_.viewport_background, 0.86F));
+      DrawRectangleRoundedLinesEx(chip_bounds, 0.20F, 8, 1.0F, Fade(colors_.panel_edge, 0.72F));
+      DrawUiText(ui_font_, text, text_bounds.x, text_bounds.y, size, text_color);
+      return;
+    }
+  }
+
   void DrawMissionStatePanel(const relativity::WorldlineSample& current, std::string_view view_mode_label) const {
     DrawPanel(layout_.mission_panel, Color {19, 23, 29, 184}, Fade(colors_.panel_edge, 0.60F));
     DrawUiText(ui_font_, "Mission State", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 14.0F, 16.0F,
@@ -1455,7 +1583,54 @@ class DashboardUI {
                label_x, layout_.simultaneity_panel.y + 160.0F, 12.0F, colors_.muted);
   }
 
+  void DrawHelpOverlay(bool cockpit_mode) const {
+    const Rectangle scrim = layout_.viewport;
+    DrawRectangleRec(scrim, Fade(colors_.app_background, 0.72F));
+
+    const Rectangle card {layout_.viewport.x + 220.0F, layout_.viewport.y + 86.0F, 760.0F, 404.0F};
+    DrawPanel(card, Color {16, 20, 26, 242}, Fade(colors_.panel_edge, 0.84F));
+
+    DrawUiText(ui_font_, "Controls", card.x + 24.0F, card.y + 20.0F, 24.0F, colors_.text);
+    DrawUiText(ui_font_, "Press H to close this overlay.", card.x + 24.0F, card.y + 52.0F, 14.0F, colors_.muted);
+
+    const float left_x = card.x + 24.0F;
+    const float right_x = card.x + 394.0F;
+    DrawUiText(ui_font_, "Playback", left_x, card.y + 92.0F, 16.0F, colors_.traveler_frame);
+    DrawUiText(ui_font_, "Space play/pause", left_x, card.y + 120.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, "Home reset mission   End jump to arrival", left_x, card.y + 144.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, "Left/Right scrub   Slider drag seeks directly", left_x, card.y + 168.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_, "Wheel outside viewport steps the mission stage", left_x, card.y + 192.0F, 14.0F, colors_.text);
+
+    DrawUiText(ui_font_, "Third-Person Camera", left_x, card.y + 236.0F, 16.0F, colors_.traveler_frame);
+    DrawUiText(ui_font_, "Wheel zoom   Right-drag orbit   Middle-drag pan", left_x, card.y + 264.0F, 14.0F,
+               colors_.text);
+    DrawUiText(ui_font_, "WASD/QZ move target   1 iso   2 side   3 front   4 top", left_x, card.y + 288.0F, 14.0F,
+               colors_.text);
+    DrawUiText(ui_font_, "C resets camera", left_x, card.y + 312.0F, 14.0F, colors_.text);
+
+    DrawUiText(ui_font_, "Mode And Export", right_x, card.y + 92.0F, 16.0F, colors_.earth_frame);
+    DrawUiText(ui_font_, "F toggles between third-person and traveler view", right_x, card.y + 120.0F, 14.0F,
+               colors_.text);
+    DrawUiText(ui_font_, "E exports summary and visual PNGs", right_x, card.y + 144.0F, 14.0F, colors_.text);
+
+    DrawUiText(ui_font_, "Traveler View", right_x, card.y + 188.0F, 16.0F, colors_.earth_frame);
+    DrawUiText(ui_font_, "Right-drag or I/J/K/L looks around from the traveler frame", right_x, card.y + 216.0F,
+               14.0F, colors_.text);
+    DrawUiText(ui_font_,
+               "The sky is a relativistic starfield: aberration compresses stars forward,", right_x, card.y + 240.0F,
+               14.0F, colors_.text);
+    DrawUiText(ui_font_, "Doppler shift changes color, and beaming boosts forward brightness.", right_x,
+               card.y + 264.0F, 14.0F, colors_.text);
+    DrawUiText(ui_font_,
+               cockpit_mode ? "Traveler view is active now." : "Press F if you want to inspect the traveler-frame sky.",
+               right_x, card.y + 288.0F, 14.0F, colors_.traveler_frame);
+
+    DrawUiText(ui_font_, "Launch/build commands stay in the README and terminal --help output.", right_x,
+               card.y + 336.0F, 13.0F, colors_.muted);
+  }
+
   void DrawControls(float stage, bool playing, const Vector2 mouse, bool cockpit_mode) const {
+    constexpr float kInstructionSize = 12.5F;
     DrawRectangleRounded(layout_.controls, 0.04F, 10, colors_.viewport_background);
     DrawRectangleRoundedLinesEx(layout_.controls, 0.04F, 10, 1.0F, colors_.panel_edge);
 
@@ -1474,18 +1649,22 @@ class DashboardUI {
     DrawCircleV(knob_center, 8.0F, colors_.text);
     DrawCircleV(knob_center, 3.0F, colors_.app_background);
 
-    DrawUiText(ui_font_, "Playback", 304.0F, 730.0F, 17.0F, colors_.muted);
-    DrawUiText(ui_font_, "Space play/pause    Left/Right scrub    wheel zooms    C resets camera", 962.0F,
-               730.0F, 14.0F, colors_.muted);
-    DrawUiText(ui_font_,
-               cockpit_mode ? "Right-drag or I/J/K/L look around    F third-person view    E export PNGs"
-                            : "Right-drag orbit    Middle-drag pan    WASD/QZ move view    F cockpit mode",
-               786.0F, 748.0F, 14.0F, colors_.muted);
-    DrawUiText(ui_font_, cockpit_mode ? "Cockpit mode active." : "Third-person world-tube active.", 470.0F, 748.0F,
-               14.0F, colors_.traveler_frame);
+    DrawUiText(ui_font_, "Playback", layout_.slider_track.x, layout_.controls.y + 14.0F, 17.0F, colors_.muted);
+    DrawUiText(ui_font_, cockpit_mode ? "Traveler view active." : "Third-person world-tube active.",
+               layout_.slider_track.x, layout_.controls.y + 57.0F, 14.0F, colors_.traveler_frame);
     DrawUiText(ui_font_,
                cosmology_note_ ? "SR model only; cosmology not included." : "SR model only.",
-               650.0F, 748.0F, 14.0F, cosmology_note_ ? colors_.warning : colors_.muted);
+               layout_.slider_track.x + 188.0F, layout_.controls.y + 57.0F, 14.0F,
+               cosmology_note_ ? colors_.warning : colors_.muted);
+    DrawUiText(ui_font_, "Space play/pause  Left/Right scrub  Wheel steps timeline outside viewport",
+               866.0F, layout_.controls.y + 14.0F, kInstructionSize, colors_.muted);
+    DrawUiText(ui_font_, cockpit_mode ? "Right-drag or I/J/K/L look around  F third-person view  E export PNGs"
+                                      : "Wheel zoom  Right-drag orbit  Middle-drag pan  F traveler view",
+               866.0F, layout_.controls.y + 34.0F, kInstructionSize, colors_.muted);
+    DrawUiText(ui_font_, cockpit_mode ? "C resets view state"
+                                      : "WASD/QZ move target  1 iso  2 side  3 front  4 top  C reset",
+               866.0F, layout_.controls.y + 54.0F, kInstructionSize, colors_.muted);
+    DrawUiText(ui_font_, "H help", 1166.0F, layout_.controls.y + 14.0F, kInstructionSize, colors_.traveler_frame);
   }
 
   const Font& ui_font_;
@@ -1498,13 +1677,13 @@ class DashboardUI {
   AppColors colors_ {};
   UiLayout layout_ {
       .viewport = {40.0F, 96.0F, 1200.0F, 600.0F},
-      .controls = {40.0F, 720.0F, 1200.0F, 64.0F},
-      .play_button = {60.0F, 736.0F, 92.0F, 32.0F},
-      .reset_button = {164.0F, 736.0F, 92.0F, 32.0F},
-      .slider_track = {304.0F, 751.0F, 560.0F, 8.0F},
+      .controls = {40.0F, 708.0F, 1200.0F, 96.0F},
+      .play_button = {60.0F, 726.0F, 92.0F, 34.0F},
+      .reset_button = {164.0F, 726.0F, 92.0F, 34.0F},
+      .slider_track = {304.0F, 746.0F, 500.0F, 8.0F},
       .mission_panel = {76.0F, 138.0F, 236.0F, 218.0F},
       .frames_panel = {1012.0F, 138.0F, 200.0F, 236.0F},
-      .simultaneity_panel = {954.0F, 392.0F, 258.0F, 186.0F},
+      .simultaneity_panel = {954.0F, 470.0F, 258.0F, 186.0F},
   };
 };
 
@@ -1573,6 +1752,7 @@ int main(int argc, char** argv) {
   bool playing = false;
   bool dragging_slider = false;
   bool export_requested = auto_export;
+  bool show_help = false;
   float stage = auto_export ? 1.0F : 0.0F;
 
   while (!WindowShouldClose()) {
@@ -1581,65 +1761,89 @@ int main(int argc, char** argv) {
     const Vector2 mouse_delta = GetMouseDelta();
     const bool mouse_in_viewport = CheckCollisionPointRec(mouse, ui.Layout().viewport);
 
-    if (ButtonClicked(ui.Layout().play_button, mouse) || IsKeyPressed(KEY_SPACE)) {
-      if (stage >= 1.0F) {
-        stage = 0.0F;
-      }
-      playing = !playing;
-    }
-    if (ButtonClicked(ui.Layout().reset_button, mouse) || IsKeyPressed(KEY_HOME)) {
-      stage = 0.0F;
-      playing = false;
-    }
-    if (IsKeyPressed(KEY_END)) {
-      stage = 1.0F;
-      playing = false;
-    }
-    if (IsKeyPressed(KEY_F)) {
-      camera.ToggleMode();
-    }
-
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
-        CheckCollisionPointRec(mouse, ExpandedRect(ui.Layout().slider_track, 12.0F))) {
-      dragging_slider = true;
-      playing = false;
-    }
-
-    if (dragging_slider) {
-      stage = SliderStageFromMouse(ui.Layout().slider_track, mouse);
-      if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+    if (IsKeyPressed(KEY_H)) {
+      show_help = !show_help;
+      if (show_help) {
+        playing = false;
         dragging_slider = false;
       }
     }
 
-    if (!dragging_slider) {
-      if (IsKeyDown(KEY_RIGHT)) {
-        stage = Clamp01(stage + (dt * 0.14F));
+    if (!show_help) {
+      if (ButtonClicked(ui.Layout().play_button, mouse) || IsKeyPressed(KEY_SPACE)) {
+        if (stage >= 1.0F) {
+          stage = 0.0F;
+        }
+        playing = !playing;
+      }
+      if (ButtonClicked(ui.Layout().reset_button, mouse) || IsKeyPressed(KEY_HOME)) {
+        stage = 0.0F;
         playing = false;
       }
-      if (IsKeyDown(KEY_LEFT)) {
-        stage = Clamp01(stage - (dt * 0.14F));
+      if (IsKeyPressed(KEY_END)) {
+        stage = 1.0F;
         playing = false;
       }
-    }
+      if (IsKeyPressed(KEY_F)) {
+        camera.ToggleMode();
+      }
+      if (!camera.IsCockpitMode()) {
+        if (IsKeyPressed(KEY_ONE)) {
+          camera.SnapToThirdPersonPreset(RelativisticCamera::ThirdPersonPreset::Isometric);
+        }
+        if (IsKeyPressed(KEY_TWO)) {
+          camera.SnapToThirdPersonPreset(RelativisticCamera::ThirdPersonPreset::Broadside);
+        }
+        if (IsKeyPressed(KEY_THREE)) {
+          camera.SnapToThirdPersonPreset(RelativisticCamera::ThirdPersonPreset::Forward);
+        }
+        if (IsKeyPressed(KEY_FOUR)) {
+          camera.SnapToThirdPersonPreset(RelativisticCamera::ThirdPersonPreset::Overhead);
+        }
+      }
 
-    const float wheel = GetMouseWheelMove();
-    if (wheel != 0.0F) {
-      if (mouse_in_viewport && !camera.IsCockpitMode()) {
-        camera.HandleViewportInput(true, {0.0F, 0.0F}, wheel, dt);
-      } else {
-        stage = Clamp01(stage + (wheel * 0.009F));
+      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+          CheckCollisionPointRec(mouse, ExpandedRect(ui.Layout().slider_track, 12.0F))) {
+        dragging_slider = true;
         playing = false;
       }
-    }
 
-    camera.HandleViewportInput(mouse_in_viewport, mouse_delta, 0.0F, dt);
+      if (dragging_slider) {
+        stage = SliderStageFromMouse(ui.Layout().slider_track, mouse);
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+          dragging_slider = false;
+        }
+      }
 
-    if (IsKeyPressed(KEY_C)) {
-      camera.ResetView();
-    }
-    if (IsKeyPressed(KEY_E)) {
-      export_requested = true;
+      if (!dragging_slider) {
+        if (IsKeyDown(KEY_RIGHT)) {
+          stage = Clamp01(stage + (dt * 0.14F));
+          playing = false;
+        }
+        if (IsKeyDown(KEY_LEFT)) {
+          stage = Clamp01(stage - (dt * 0.14F));
+          playing = false;
+        }
+      }
+
+      const float wheel = GetMouseWheelMove();
+      if (wheel != 0.0F) {
+        if (mouse_in_viewport && !camera.IsCockpitMode()) {
+          camera.HandleViewportInput(true, {0.0F, 0.0F}, wheel, dt);
+        } else {
+          stage = Clamp01(stage + (wheel * 0.009F));
+          playing = false;
+        }
+      }
+
+      camera.HandleViewportInput(mouse_in_viewport, mouse_delta, 0.0F, dt);
+
+      if (IsKeyPressed(KEY_C)) {
+        camera.ResetView();
+      }
+      if (IsKeyPressed(KEY_E)) {
+        export_requested = true;
+      }
     }
 
     if (playing) {
@@ -1662,7 +1866,7 @@ int main(int argc, char** argv) {
     BeginDrawing();
     ClearBackground(colors.app_background);
     ui.Draw(scene.RenderTarget(), current, stage, playing, mouse, camera.ModeLabel(), camera.IsCockpitMode(), labels,
-            current.progress >= 0.42);
+            current.progress >= 0.42, show_help);
     EndDrawing();
 
     if (export_requested) {

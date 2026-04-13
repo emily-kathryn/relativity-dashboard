@@ -45,7 +45,7 @@ The visualizer now renders a single cinematic scene:
 - a proper-time-rate world-tube whose radius follows `dτ/dt = 1 / gamma`
 - traveler proper-time pulse rings and Earth-frame coordinate-time pulse rings
 - a ship accelerating away from Earth and braking toward the destination
-- a first-person cockpit mode with relativistic aberration, Doppler shift, and beaming in the starfield
+- a first-person traveler view with relativistic aberration, Doppler shift, and beaming in the starfield
 - frame-specific overlays for Earth-frame and traveler-frame quantities, including a simultaneity dashboard
 - direct playback controls and a mission-stage scrubber
 
@@ -140,12 +140,19 @@ Visualizer controls:
 - middle-drag in the viewport: pan camera
 - `W` / `A` / `S` / `D`: translate the third-person view target
 - `Q` / `Z`: move the third-person view target up or down
-- `F`: toggle cockpit mode
-- right-drag in cockpit mode: look around from the traveler frame
-- `I` / `J` / `K` / `L`: cockpit look-around with the keyboard
+- `1`: snap to the default isometric view
+- `2`: snap to a side view
+- `3`: snap to a front view
+- `4`: snap to a top view
+- `F`: toggle traveler view
+- right-drag in traveler view: look around from the traveler frame
+- `I` / `J` / `K` / `L`: traveler-view look-around with the keyboard
 - `C`: reset view and cockpit look direction
+- `H`: open the in-app controls overlay
 - `E`: export `mission_export_summary.png` and `mission_export_visual.png` from the current view
 - `End`: jump to arrival
+
+Traveler view is not a ship-interior view. It is a traveler-frame sky view meant to show how the forward sky changes under relativistic aberration, Doppler shift, and beaming.
 
 Available destination presets:
 
