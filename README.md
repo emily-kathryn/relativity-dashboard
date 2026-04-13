@@ -45,6 +45,7 @@ The visualizer now renders a single cinematic scene:
 - a proper-time-rate world-tube whose radius follows `dτ/dt = 1 / gamma`
 - traveler proper-time pulse rings and Earth-frame coordinate-time pulse rings
 - a ship accelerating away from Earth and braking toward the destination
+- an Earth-anchored solar-system context layer from a bundled NASA/JPL Horizons snapshot
 - a first-person traveler view with relativistic aberration, Doppler shift, and beaming in the starfield
 - frame-specific overlays for Earth-frame and traveler-frame quantities, including a simultaneity dashboard
 - direct playback controls and a mission-stage scrubber
@@ -153,6 +154,8 @@ Visualizer controls:
 - `End`: jump to arrival
 
 Traveler view is not a ship-interior view. It is a traveler-frame sky view meant to show how the forward sky changes under relativistic aberration, Doppler shift, and beaming.
+
+The third-person scene also includes a contextual solar-system snapshot. The Sun and major planets come from a bundled NASA/JPL Horizons heliocentric vector table dated January 1, 2026 (TDB). Those body positions are anchored to Earth and radially compressed for visibility, so they are intended as orientation context rather than a true-to-scale local dynamics model.
 
 Available destination presets:
 

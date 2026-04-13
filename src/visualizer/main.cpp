@@ -6,8 +6,11 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -325,12 +328,29 @@ struct UiLayout {
   Rectangle mission_panel {};
   Rectangle frames_panel {};
   Rectangle simultaneity_panel {};
+  Rectangle solar_context_panel {};
 };
 
 struct SceneLabels {
   Vector2 earth {};
   Vector2 destination {};
   Vector2 turnaround {};
+};
+
+struct SolarSystemBody {
+  std::string name;
+  int horizons_id {};
+  Vector3 heliocentric_position_au {};
+  float display_radius {};
+  Color color {};
+};
+
+struct SolarSystemContext {
+  std::string source_label;
+  std::string epoch_label;
+  std::vector<SolarSystemBody> bodies;
+  Vector3 earth_heliocentric_position_au {};
+  bool ready {false};
 };
 
 double ParseDouble(const std::string_view text, const std::string_view name) {
@@ -351,6 +371,183 @@ std::size_t ParseSize(const std::string_view text, const std::string_view name) 
     throw std::invalid_argument("invalid integer value for " + std::string(name));
   }
   return static_cast<std::size_t>(value);
+}
+
+std::string Trim(const std::string_view text) {
+  const auto begin = text.find_first_not_of(" \t\r\n");
+  if (begin == std::string_view::npos) {
+    return {};
+  }
+  const auto end = text.find_last_not_of(" \t\r\n");
+  return std::string(text.substr(begin, (end - begin) + 1));
+}
+
+std::vector<std::string> SplitCsvLine(const std::string& line) {
+  std::vector<std::string> fields;
+  std::string current;
+  bool in_quotes = false;
+
+  for (char character : line) {
+    if (character == '"') {
+      in_quotes = !in_quotes;
+      continue;
+    }
+    if (character == ',' && !in_quotes) {
+      fields.push_back(Trim(current));
+      current.clear();
+      continue;
+    }
+    current.push_back(character);
+  }
+
+  fields.push_back(Trim(current));
+  return fields;
+}
+
+std::optional<std::filesystem::path> FindDataFile(std::string_view relative_path) {
+  const std::filesystem::path current = std::filesystem::current_path();
+  const std::filesystem::path executable = std::filesystem::path(GetApplicationDirectory());
+  const std::array<std::filesystem::path, 6> candidates {
+      current / std::string(relative_path),
+      current / ".." / std::string(relative_path),
+      current / ".." / ".." / std::string(relative_path),
+      executable / std::string(relative_path),
+      executable / ".." / std::string(relative_path),
+      executable / ".." / ".." / std::string(relative_path),
+  };
+
+  for (const auto& candidate : candidates) {
+    std::error_code error;
+    const std::filesystem::path normalized = std::filesystem::weakly_canonical(candidate, error);
+    const std::filesystem::path resolved = error ? candidate : normalized;
+    if (std::filesystem::exists(resolved)) {
+      return resolved;
+    }
+  }
+
+  return std::nullopt;
+}
+
+float SolarBodyRadius(std::string_view name) {
+  if (name == "Sun") {
+    return 0.34F;
+  }
+  if (name == "Jupiter") {
+    return 0.20F;
+  }
+  if (name == "Saturn") {
+    return 0.18F;
+  }
+  if (name == "Uranus" || name == "Neptune") {
+    return 0.15F;
+  }
+  if (name == "Earth" || name == "Venus") {
+    return 0.13F;
+  }
+  if (name == "Mercury" || name == "Mars") {
+    return 0.10F;
+  }
+  return 0.11F;
+}
+
+Color SolarBodyColor(std::string_view name) {
+  if (name == "Sun") {
+    return {236, 216, 150, 255};
+  }
+  if (name == "Mercury") {
+    return {164, 154, 144, 255};
+  }
+  if (name == "Venus") {
+    return {198, 171, 120, 255};
+  }
+  if (name == "Earth") {
+    return {120, 150, 192, 255};
+  }
+  if (name == "Mars") {
+    return {194, 118, 92, 255};
+  }
+  if (name == "Jupiter") {
+    return {196, 176, 136, 255};
+  }
+  if (name == "Saturn") {
+    return {208, 192, 142, 255};
+  }
+  if (name == "Uranus") {
+    return {134, 186, 196, 255};
+  }
+  if (name == "Neptune") {
+    return {106, 132, 214, 255};
+  }
+  return {180, 180, 180, 255};
+}
+
+SolarSystemContext LoadSolarSystemContext(std::string_view relative_path) {
+  SolarSystemContext context {
+      .source_label = "NASA/JPL Horizons",
+      .epoch_label = {},
+      .bodies = {},
+      .earth_heliocentric_position_au = {},
+      .ready = false,
+  };
+
+  const auto dataset_path = FindDataFile(relative_path);
+  if (!dataset_path.has_value()) {
+    TraceLog(LOG_WARNING, "solar-system dataset not found: %s", std::string(relative_path).c_str());
+    return context;
+  }
+
+  std::ifstream input(*dataset_path);
+  if (!input.is_open()) {
+    TraceLog(LOG_WARNING, "failed to open solar-system dataset: %s", dataset_path->string().c_str());
+    return context;
+  }
+
+  std::string line;
+  bool header_seen = false;
+  while (std::getline(input, line)) {
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+
+    if (!header_seen) {
+      header_seen = true;
+      continue;
+    }
+
+    const std::vector<std::string> columns = SplitCsvLine(line);
+    if (columns.size() != 6) {
+      continue;
+    }
+
+    SolarSystemBody body {
+        .name = columns[0],
+        .horizons_id = static_cast<int>(ParseSize(columns[1], "horizons_id")),
+        .heliocentric_position_au =
+            {
+                static_cast<float>(ParseDouble(columns[3], "x_au")),
+                static_cast<float>(ParseDouble(columns[4], "y_au")),
+                static_cast<float>(ParseDouble(columns[5], "z_au")),
+            },
+        .display_radius = SolarBodyRadius(columns[0]),
+        .color = SolarBodyColor(columns[0]),
+    };
+
+    if (context.epoch_label.empty()) {
+      context.epoch_label = columns[2];
+    }
+    if (body.name == "Earth") {
+      context.earth_heliocentric_position_au = body.heliocentric_position_au;
+    }
+
+    context.bodies.push_back(body);
+  }
+
+  context.ready = !context.bodies.empty();
+  if (!context.ready) {
+    TraceLog(LOG_WARNING, "solar-system dataset parsed but had no body rows: %s", dataset_path->string().c_str());
+  }
+
+  return context;
 }
 
 std::string UsageText(const char* program_name) {
@@ -489,13 +686,28 @@ bool ContainsRect(const Rectangle& outer, const Rectangle& inner) {
          && (inner.y + inner.height) <= (outer.y + outer.height);
 }
 
-bool IntersectsAny(const Rectangle& candidate, const std::array<Rectangle, 3>& blockers) {
+bool IntersectsAny(const Rectangle& candidate, std::span<const Rectangle> blockers) {
   for (const Rectangle& blocker : blockers) {
     if (CheckCollisionRecs(candidate, blocker)) {
       return true;
     }
   }
   return false;
+}
+
+Vector3 CompressSolarSystemOffset(Vector3 delta_au) {
+  const float magnitude = std::sqrt((delta_au.x * delta_au.x) + (delta_au.y * delta_au.y) + (delta_au.z * delta_au.z));
+  if (magnitude <= 1.0e-4F) {
+    return {0.0F, 0.0F, 0.0F};
+  }
+
+  constexpr float kCompressedUnitsPerLogAu = 1.62F;
+  const float compressed_radius = static_cast<float>(std::log1p(magnitude)) * kCompressedUnitsPerLogAu;
+  return {
+      (delta_au.x / magnitude) * compressed_radius,
+      (delta_au.y / magnitude) * compressed_radius,
+      (delta_au.z / magnitude) * compressed_radius,
+  };
 }
 
 void DrawButton(const Font& font, const Rectangle& bounds, const char* label, bool active, bool hover, Color fill,
@@ -1150,9 +1362,11 @@ class RelativisticCamera {
 
 class MissionScene {
  public:
-  MissionScene(const relativity::MissionResult& mission, const Rectangle& viewport, const AppColors& colors)
+  MissionScene(const relativity::MissionResult& mission, const Rectangle& viewport, const SolarSystemContext& solar_system,
+               const AppColors& colors)
       : mission_(mission),
         viewport_(viewport),
+        solar_system_(solar_system),
         colors_(colors),
         scene_target_(LoadRenderTexture(static_cast<int>(viewport.width), static_cast<int>(viewport.height))),
         lighting_shader_(LoadShaderFromMemory(kLightingVertexShader, kLightingFragmentShader)),
@@ -1242,6 +1456,30 @@ class MissionScene {
   }
 
  private:
+  void DrawSolarSystemContext() const {
+    if (!solar_system_.ready) {
+      return;
+    }
+
+    for (const auto& body : solar_system_.bodies) {
+      if (body.name == "Earth") {
+        continue;
+      }
+
+      const Vector3 delta_au = Subtract(body.heliocentric_position_au, solar_system_.earth_heliocentric_position_au);
+      const Vector3 body_world = Add(earth_world_, CompressSolarSystemOffset(delta_au));
+      DrawLine3D(earth_world_, body_world, Fade(body.color, 0.18F));
+      DrawSphereEx(body_world, body.display_radius, 14, 14, Fade(body.color, 0.96F));
+      DrawSphereWires(body_world, body.display_radius, 10, 10, Fade(colors_.structure, 0.30F));
+
+      if (body.name == "Saturn") {
+        DrawCircle3D(body_world, body.display_radius * 1.85F, {0.1F, 1.0F, 0.18F}, 72.0F, Fade(body.color, 0.44F));
+      }
+    }
+
+    DrawCircle3D(earth_world_, 6.0F, {0.0F, 1.0F, 0.0F}, 90.0F, Fade(colors_.earth_frame, 0.10F));
+  }
+
   void UpdateTubeModel(std::size_t current_index) {
     if (current_index <= 1) {
       return;
@@ -1282,6 +1520,7 @@ class MissionScene {
     BeginMode3D(camera);
 
     DrawGrid(24, 1.5F);
+    DrawSolarSystemContext();
     DrawTrajectoryCurve(earth_world_, turnaround_world_, destination_world_, 1.0F, 90, Fade(colors_.grid, 0.28F));
     DrawTrajectoryCurve(earth_world_, turnaround_world_, destination_world_, travel_fraction, 90,
                         Fade(colors_.structure, 0.32F));
@@ -1367,8 +1606,9 @@ class MissionScene {
                viewport_.width - 226.0F, 18.0F, 13.0F, Fade(colors_.traveler_frame, 0.82F));
   }
 
-  const relativity::MissionResult& mission_;
+ const relativity::MissionResult& mission_;
   Rectangle viewport_ {};
+  SolarSystemContext solar_system_ {};
   AppColors colors_ {};
   RenderTexture2D scene_target_ {};
   Shader lighting_shader_ {};
@@ -1397,7 +1637,7 @@ class DashboardUI {
  public:
   DashboardUI(const Font& ui_font, const relativity::MissionResult& mission, const std::string& mission_name,
               const std::string& destination_name, double coordinate_pulse_interval, double proper_pulse_interval,
-              bool cosmology_note, const AppColors& colors)
+              bool cosmology_note, const SolarSystemContext& solar_system, const AppColors& colors)
       : ui_font_(ui_font),
         mission_(mission),
         mission_name_(mission_name),
@@ -1405,6 +1645,7 @@ class DashboardUI {
         coordinate_pulse_interval_(coordinate_pulse_interval),
         proper_pulse_interval_(proper_pulse_interval),
         cosmology_note_(cosmology_note),
+        solar_system_(solar_system),
         colors_(colors) {}
 
   const UiLayout& Layout() const {
@@ -1429,10 +1670,11 @@ class DashboardUI {
     DrawRectangleRoundedLinesEx(layout_.viewport, 0.015F, 10, 1.0F, colors_.panel_edge);
 
     if (!cockpit_mode) {
-      const std::array<Rectangle, 3> overlay_exclusions {
+      const std::array<Rectangle, 4> overlay_exclusions {
           ExpandedRect(layout_.mission_panel, 10.0F),
           ExpandedRect(layout_.frames_panel, 10.0F),
           ExpandedRect(layout_.simultaneity_panel, 10.0F),
+          ExpandedRect(layout_.solar_context_panel, 10.0F),
       };
       DrawWorldLabel("Earth", labels.earth, 18.0F, colors_.structure, overlay_exclusions);
       DrawWorldLabel(destination_name_, labels.destination, 16.0F, colors_.structure, overlay_exclusions);
@@ -1445,6 +1687,9 @@ class DashboardUI {
     DrawMissionStatePanel(current, view_mode_label);
     DrawFrameTimesPanel(current);
     DrawSimultaneityPanel(current, cockpit_mode);
+    if (!cockpit_mode) {
+      DrawSolarContextPanel();
+    }
     DrawControls(stage, playing, mouse, cockpit_mode);
     if (show_help) {
       DrawHelpOverlay(cockpit_mode);
@@ -1453,7 +1698,7 @@ class DashboardUI {
 
  private:
   void DrawWorldLabel(const std::string& text, Vector2 viewport_anchor, float size, Color text_color,
-                      const std::array<Rectangle, 3>& overlay_exclusions) const {
+                      std::span<const Rectangle> overlay_exclusions) const {
     const Vector2 anchor {layout_.viewport.x + viewport_anchor.x, layout_.viewport.y + viewport_anchor.y};
     if (!CheckCollisionPointRec(anchor, layout_.viewport)) {
       return;
@@ -1583,6 +1828,22 @@ class DashboardUI {
                label_x, layout_.simultaneity_panel.y + 160.0F, 12.0F, colors_.muted);
   }
 
+  void DrawSolarContextPanel() const {
+    if (!solar_system_.ready) {
+      return;
+    }
+
+    DrawPanel(layout_.solar_context_panel, Color {19, 23, 29, 184}, Fade(colors_.panel_edge, 0.60F));
+    DrawUiText(ui_font_, "Solar System Context", layout_.solar_context_panel.x + 16.0F,
+               layout_.solar_context_panel.y + 12.0F, 15.0F, colors_.muted);
+    DrawUiText(ui_font_, solar_system_.source_label, layout_.solar_context_panel.x + 16.0F,
+               layout_.solar_context_panel.y + 32.0F, 13.0F, colors_.text);
+    DrawUiText(ui_font_, solar_system_.epoch_label, layout_.solar_context_panel.x + 16.0F,
+               layout_.solar_context_panel.y + 48.0F, 12.0F, colors_.text);
+    DrawUiText(ui_font_, "Earth-anchored heliocentric snapshot; radial distances compressed.", layout_.solar_context_panel.x + 16.0F,
+               layout_.solar_context_panel.y + 68.0F, 12.0F, colors_.muted);
+  }
+
   void DrawHelpOverlay(bool cockpit_mode) const {
     const Rectangle scrim = layout_.viewport;
     DrawRectangleRec(scrim, Fade(colors_.app_background, 0.72F));
@@ -1674,6 +1935,7 @@ class DashboardUI {
   double coordinate_pulse_interval_ {};
   double proper_pulse_interval_ {};
   bool cosmology_note_ {};
+  SolarSystemContext solar_system_ {};
   AppColors colors_ {};
   UiLayout layout_ {
       .viewport = {40.0F, 96.0F, 1200.0F, 600.0F},
@@ -1684,6 +1946,7 @@ class DashboardUI {
       .mission_panel = {76.0F, 138.0F, 236.0F, 218.0F},
       .frames_panel = {1012.0F, 138.0F, 200.0F, 236.0F},
       .simultaneity_panel = {954.0F, 470.0F, 258.0F, 186.0F},
+      .solar_context_panel = {356.0F, 112.0F, 388.0F, 96.0F},
   };
 };
 
@@ -1744,9 +2007,10 @@ int main(int argc, char** argv) {
 
   bool custom_font_loaded = false;
   const Font ui_font = LoadUiFont(custom_font_loaded);
+  const SolarSystemContext solar_system = LoadSolarSystemContext("data/solar_system_horizons_2026-01-01.csv");
   DashboardUI ui(ui_font, mission, mission_name, destination_name, coordinate_pulse_interval, proper_pulse_interval,
-                 cosmology_note, colors);
-  MissionScene scene(mission, ui.Layout().viewport, colors);
+                 cosmology_note, solar_system, colors);
+  MissionScene scene(mission, ui.Layout().viewport, solar_system, colors);
   RelativisticCamera camera;
 
   bool playing = false;
