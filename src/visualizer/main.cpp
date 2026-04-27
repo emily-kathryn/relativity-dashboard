@@ -634,6 +634,14 @@ std::string FormatFixed(double value, int precision = 3) {
   return out.str();
 }
 
+std::string FormatSignedFixed(double value, int precision = 3) {
+  std::ostringstream out;
+  out.setf(std::ios::fixed);
+  out.precision(precision);
+  out << std::showpos << value;
+  return out.str();
+}
+
 Font LoadUiFont(bool& custom_font_loaded) {
   constexpr const char* kFontPath = "/System/Library/Fonts/Supplemental/Arial.ttf";
   if (FileExists(kFontPath)) {
@@ -661,6 +669,11 @@ float MeasureUiText(const Font& font, const char* text, float size) {
 
 float Clamp01(float value) {
   return std::clamp(value, 0.0F, 1.0F);
+}
+
+float SmoothStep01(float value) {
+  const float x = Clamp01(value);
+  return x * x * (3.0F - (2.0F * x));
 }
 
 double LerpDouble(double start, double end, double amount) {
@@ -947,6 +960,9 @@ const char* PhaseLabel(double progress) {
   if (progress < 0.04) {
     return "departure";
   }
+  if (progress >= 0.485 && progress <= 0.535) {
+    return "turnaround";
+  }
   if (progress < 0.5) {
     return "accelerating";
   }
@@ -1045,6 +1061,14 @@ void DrawTrajectoryCurve(Vector3 start, Vector3 control, Vector3 end, float maxi
     DrawLine3D(previous, current, color);
     previous = current;
   }
+}
+
+Vector3 ShipBodyForward(const PathFrame& frame, double progress) {
+  constexpr float kFlipStartProgress = 0.465F;
+  constexpr float kFlipEndProgress = 0.535F;
+  const float flip_amount =
+      SmoothStep01((static_cast<float>(progress) - kFlipStartProgress) / (kFlipEndProgress - kFlipStartProgress));
+  return Normalize(RotateAroundAxis(frame.tangent, frame.up, PI * flip_amount));
 }
 
 bool NeedsCosmologyNote(double distance_ly) {
@@ -1480,6 +1504,93 @@ class MissionScene {
     DrawCircle3D(earth_world_, 6.0F, {0.0F, 1.0F, 0.0F}, 90.0F, Fade(colors_.earth_frame, 0.10F));
   }
 
+  void DrawInertialReferenceGrid() const {
+    constexpr int kHalfLineCount = 12;
+    constexpr float kSpacing = 1.5F;
+    constexpr float kExtent = static_cast<float>(kHalfLineCount) * kSpacing;
+
+    for (int index = -kHalfLineCount; index <= kHalfLineCount; ++index) {
+      const float offset = static_cast<float>(index) * kSpacing;
+      const bool major_line = index % 4 == 0;
+      const Color line_color = Fade(colors_.grid, major_line ? 0.24F : 0.10F);
+      DrawLine3D({-kExtent, 0.0F, offset}, {kExtent, 0.0F, offset}, line_color);
+      DrawLine3D({offset, 0.0F, -kExtent}, {offset, 0.0F, kExtent}, line_color);
+    }
+
+    DrawLine3D({-kExtent, 0.0F, 0.0F}, {kExtent, 0.0F, 0.0F}, Fade(colors_.earth_frame, 0.20F));
+    DrawLine3D({0.0F, 0.0F, -kExtent}, {0.0F, 0.0F, kExtent}, Fade(colors_.earth_frame, 0.16F));
+  }
+
+  void DrawMissionReferenceFrame() const {
+    const Vector3 baseline = Subtract(destination_world_, earth_world_);
+    const Vector3 baseline_direction = Normalize(baseline);
+    const Vector3 baseline_right = Normalize(Cross({0.0F, 1.0F, 0.0F}, baseline_direction));
+
+    DrawLine3D(earth_world_, destination_world_, Fade(colors_.earth_frame, 0.26F));
+    for (int tick = 0; tick <= 10; ++tick) {
+      const float fraction = static_cast<float>(tick) / 10.0F;
+      const PathFrame frame = EvaluatePathFrame(earth_world_, turnaround_world_, destination_world_, fraction, 1.0F);
+      const float major_tick = tick % 5 == 0 ? 0.46F : 0.28F;
+      const Color tick_color = tick == 5 ? Fade(colors_.traveler_frame, 0.54F) : Fade(colors_.earth_frame, 0.30F);
+      DrawLine3D(Add(frame.center, Scale(frame.right, -major_tick)), Add(frame.center, Scale(frame.right, major_tick)),
+                 tick_color);
+      DrawLine3D(Add(frame.center, Scale(frame.up, -major_tick * 0.65F)),
+                 Add(frame.center, Scale(frame.up, major_tick * 0.65F)), Fade(tick_color, 0.70F));
+    }
+
+    const PathFrame turnaround_frame =
+        EvaluatePathFrame(earth_world_, turnaround_world_, destination_world_, 0.5F, 1.0F);
+    DrawRingSegments(turnaround_frame, 2.25F, 0.014F, Fade(colors_.traveler_frame, 0.42F), 56);
+    DrawLine3D(Add(turnaround_curve_world_, Scale(turnaround_frame.right, -2.5F)),
+               Add(turnaround_curve_world_, Scale(turnaround_frame.right, 2.5F)), Fade(colors_.traveler_frame, 0.22F));
+    DrawLine3D(Add(turnaround_curve_world_, Scale(turnaround_frame.up, -1.55F)),
+               Add(turnaround_curve_world_, Scale(turnaround_frame.up, 1.55F)), Fade(colors_.traveler_frame, 0.22F));
+
+    for (int offset = -6; offset <= 6; ++offset) {
+      if (offset == 0) {
+        continue;
+      }
+      const float line_offset = static_cast<float>(offset) * 1.5F;
+      const Color line_color = Fade(colors_.grid, offset % 3 == 0 ? 0.18F : 0.10F);
+      DrawLine3D(Add(earth_world_, Scale(baseline_right, line_offset)),
+                 Add(destination_world_, Scale(baseline_right, line_offset)), line_color);
+    }
+  }
+
+  void DrawShip(const PathFrame& ship_frame, const relativity::WorldlineSample& current) const {
+    const Vector3 ship_world = ship_frame.center;
+    const Vector3 ship_forward = ShipBodyForward(ship_frame, current.progress);
+    const Vector3 ship_right = Normalize(Cross(ship_frame.up, ship_forward));
+    const Vector3 ship_up = Normalize(Cross(ship_forward, ship_right));
+    const bool decelerating_phase = current.signed_proper_acceleration_ly_per_year2 < 0.0;
+    const float acceleration_direction_sign = decelerating_phase ? -1.0F : 1.0F;
+
+    const Vector3 probe_tail = Add(ship_world, Scale(ship_forward, -0.70F));
+    const Vector3 probe_nose = Add(ship_world, Scale(ship_forward, 0.78F));
+    DrawCylinderEx(probe_tail, probe_nose, 0.17F, 0.055F, 14, Fade(colors_.text, 0.96F));
+    DrawCylinderEx(Add(probe_tail, Scale(ship_forward, -0.18F)), probe_tail, 0.20F, 0.15F, 14,
+                   Fade(colors_.structure, 0.88F));
+    DrawSphereEx(ship_world, 0.13F, 10, 10, Fade(colors_.app_background, 0.92F));
+
+    const Vector3 wing_center = Add(ship_world, Scale(ship_forward, -0.10F));
+    DrawCylinderEx(Add(wing_center, Scale(ship_right, -0.42F)), Add(wing_center, Scale(ship_right, 0.42F)), 0.025F,
+                   0.025F, 6, Fade(colors_.structure, 0.86F));
+    DrawCylinderEx(Add(probe_tail, Scale(ship_up, -0.34F)), Add(probe_tail, Scale(ship_up, 0.34F)), 0.022F, 0.022F, 6,
+                   Fade(colors_.structure, 0.70F));
+
+    const Vector3 exhaust_end = Add(probe_tail, Scale(ship_forward, -0.54F - (0.46F * static_cast<float>(current.beta))));
+    DrawCylinderEx(probe_tail, exhaust_end, 0.12F, 0.0F, 10, Fade(colors_.traveler_frame, 0.54F));
+
+    const Vector3 acceleration_offset_start = Add(ship_world, {0.0F, 0.78F, 0.0F});
+    const float acceleration_vector_length = 0.86F + (1.55F * static_cast<float>(current.beta));
+    const Vector3 acceleration_direction = Scale(ship_frame.tangent, acceleration_direction_sign);
+    const Vector3 acceleration_vector_end =
+        Add(acceleration_offset_start, Scale(acceleration_direction, acceleration_vector_length));
+    DrawCylinderEx(acceleration_offset_start, acceleration_vector_end, 0.03F, 0.03F, 10, colors_.traveler_frame);
+    DrawCylinderEx(Add(acceleration_vector_end, Scale(acceleration_direction, -0.18F)), acceleration_vector_end, 0.10F,
+                   0.0F, 10, colors_.traveler_frame);
+  }
+
   void UpdateTubeModel(std::size_t current_index) {
     if (current_index <= 1) {
       return;
@@ -1519,7 +1630,8 @@ class MissionScene {
 
     BeginMode3D(camera);
 
-    DrawGrid(24, 1.5F);
+    DrawInertialReferenceGrid();
+    DrawMissionReferenceFrame();
     DrawSolarSystemContext();
     DrawTrajectoryCurve(earth_world_, turnaround_world_, destination_world_, 1.0F, 90, Fade(colors_.grid, 0.28F));
     DrawTrajectoryCurve(earth_world_, turnaround_world_, destination_world_, travel_fraction, 90,
@@ -1547,21 +1659,7 @@ class MissionScene {
       DrawRingSegments(frame, frame.proper_time_rate_radius + 0.03F, 0.030F, Fade(colors_.traveler_frame, 0.70F), 28);
     }
 
-    const Vector3 ship_world = ship_frame.center;
-    const bool decelerating_phase = current.signed_proper_acceleration_ly_per_year2 < 0.0;
-    const Vector3 acceleration_offset_start = Add(ship_world, {0.0F, 0.78F, 0.0F});
-    const float acceleration_vector_length = 0.86F + (1.55F * static_cast<float>(current.beta));
-    const float acceleration_direction_sign = decelerating_phase ? -1.0F : 1.0F;
-    const Vector3 acceleration_vector_end =
-        Add(acceleration_offset_start, Scale(ship_frame.tangent, acceleration_vector_length * acceleration_direction_sign));
-    const Vector3 probe_tail = Add(ship_world, Scale(ship_frame.tangent, -0.65F));
-    const Vector3 probe_nose = Add(ship_world, Scale(ship_frame.tangent, 0.65F));
-
-    DrawCylinderEx(probe_tail, probe_nose, 0.16F, 0.08F, 12, Fade(colors_.text, 0.96F));
-    DrawSphereEx(ship_world, 0.15F, 10, 10, Fade(colors_.app_background, 0.92F));
-    DrawCylinderEx(acceleration_offset_start, acceleration_vector_end, 0.03F, 0.03F, 10, colors_.traveler_frame);
-    DrawCylinderEx(Add(acceleration_vector_end, Scale(ship_frame.tangent, -0.18F)), acceleration_vector_end, 0.10F, 0.0F,
-                   10, colors_.traveler_frame);
+    DrawShip(ship_frame, current);
 
     EndMode3D();
   }
@@ -1680,7 +1778,7 @@ class DashboardUI {
       DrawWorldLabel(destination_name_, labels.destination, 16.0F, colors_.structure, overlay_exclusions);
 
       if (show_turnaround_label) {
-        DrawWorldLabel("Turnaround Event", labels.turnaround, 15.0F, colors_.text, overlay_exclusions);
+        DrawWorldLabel("Turnaround: a -> -a", labels.turnaround, 15.0F, colors_.text, overlay_exclusions);
       }
     }
 
@@ -1746,13 +1844,13 @@ class DashboardUI {
                colors_.muted);
     DrawUiText(ui_font_, FormatFixed(current.gamma, 4), layout_.mission_panel.x + 138.0F, layout_.mission_panel.y + 118.0F,
                14.0F, colors_.text);
-    DrawUiText(ui_font_, "proper-time rate", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 144.0F, 14.0F,
+    DrawUiText(ui_font_, "dτ/dt", layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 144.0F, 14.0F,
                colors_.muted);
     DrawUiText(ui_font_, FormatFixed(current.proper_time_rate, 4), layout_.mission_panel.x + 138.0F,
                layout_.mission_panel.y + 144.0F, 14.0F, colors_.text);
     DrawUiText(ui_font_, DynamicsLabel(current.signed_proper_acceleration_ly_per_year2), layout_.mission_panel.x + 16.0F,
                layout_.mission_panel.y + 170.0F, 13.0F, colors_.muted);
-    DrawUiText(ui_font_, FormatFixed(std::abs(current.signed_proper_acceleration_ly_per_year2), 3) + " ly / y^2",
+    DrawUiText(ui_font_, FormatSignedFixed(current.signed_proper_acceleration_ly_per_year2, 3) + " ly / y^2",
                layout_.mission_panel.x + 16.0F, layout_.mission_panel.y + 188.0F, 13.0F, colors_.text);
   }
 
@@ -1766,7 +1864,7 @@ class DashboardUI {
     const float earth_marker_y = earth_rail.y + earth_rail.height - (earth_rail.height * earth_progress);
     const float traveler_marker_y = traveler_rail.y + traveler_rail.height - (traveler_rail.height * traveler_progress);
 
-    DrawUiText(ui_font_, "Frame Times", layout_.frames_panel.x + 16.0F, layout_.frames_panel.y + 14.0F, 16.0F,
+    DrawUiText(ui_font_, "Frame Clocks", layout_.frames_panel.x + 16.0F, layout_.frames_panel.y + 14.0F, 16.0F,
                colors_.muted);
     DrawUiText(ui_font_, "Earth", earth_rail.x - 2.0F, earth_rail.y - 24.0F, 13.0F, colors_.earth_frame);
     DrawUiText(ui_font_, "Traveler", traveler_rail.x - 8.0F, traveler_rail.y - 24.0F, 13.0F, colors_.traveler_frame);
@@ -1808,13 +1906,13 @@ class DashboardUI {
 
     const float label_x = layout_.simultaneity_panel.x + 16.0F;
     const float value_x = layout_.simultaneity_panel.x + 168.0F;
-    DrawUiText(ui_font_, "Proper Time", label_x, layout_.simultaneity_panel.y + 46.0F, 14.0F, colors_.traveler_frame);
+    DrawUiText(ui_font_, "Proper time τ", label_x, layout_.simultaneity_panel.y + 46.0F, 14.0F, colors_.traveler_frame);
     DrawUiText(ui_font_, FormatFixed(current.proper_time_years, 3) + " y", value_x,
                layout_.simultaneity_panel.y + 46.0F, 14.0F, colors_.text);
-    DrawUiText(ui_font_, "Coordinate Time", label_x, layout_.simultaneity_panel.y + 74.0F, 14.0F, colors_.earth_frame);
+    DrawUiText(ui_font_, "Coordinate time t", label_x, layout_.simultaneity_panel.y + 74.0F, 14.0F, colors_.earth_frame);
     DrawUiText(ui_font_, FormatFixed(current.coordinate_time_years, 3) + " y", value_x,
                layout_.simultaneity_panel.y + 74.0F, 14.0F, colors_.text);
-    DrawUiText(ui_font_, "Delayed Observation", label_x, layout_.simultaneity_panel.y + 102.0F, 14.0F,
+    DrawUiText(ui_font_, "Observed at Earth", label_x, layout_.simultaneity_panel.y + 102.0F, 14.0F,
                colors_.traveler_frame);
     DrawUiText(ui_font_, FormatFixed(DelayedObservationTimeYears(current), 3) + " y", value_x,
                layout_.simultaneity_panel.y + 102.0F, 14.0F, colors_.text);
